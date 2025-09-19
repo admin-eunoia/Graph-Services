@@ -11,30 +11,34 @@ class GraphServices():
         self.graph_url = "https://graph.microsoft.com/v1.0"
         
         
-    def copy_excel(self, original_name: str, copy_name: str, folder_path: str) -> None:
+    def copy_excel(self, name) -> None:
         """
         Copia un archivo Excel en OneDrive.
 
-        :param original_name: Nombre del archivo origen dentro de la carpeta (p.ej. "Plantilla.xlsx")
-        :param copy_name: Nombre del archivo destino (p.ej. "MiCopia.xlsx")
+        :param template_name: Nombre del archivo origen dentro de la carpeta (p.ej. "Plantilla.xlsx")
+        :param copy_template_name: Nombre del archivo destino (p.ej. "MiCopia.xlsx")
         :param folder_path: Ruta relativa de la carpeta en OneDrive (p.ej. "Documentos/Proyectos")
         """
         headers = self.auth.get_headers()
 
-        ruta_archivo_origen = f"{folder_path}/{original_name}"
+        template_name = get_template_name()
+        copy_template_name = get_copy_template_name()
+        folder_path = get_folder_path()
+
+        ruta_archivo_origen = f"{folder_path}/{template_name}"
         folder_id = self.auth.get_folder_id(folder_path)
         source_file_id = self.auth.get_file_id(ruta_archivo_origen)
         
         url = f"{self.graph_url}/users/{self.user_id}/drive/items/{source_file_id}/copy"
         
         body = {
-            "name": copy_name,
+            "name": copy_template_name,
             "parentReference": {"id": folder_id},
         }
         
         response = requests.post(url, headers=headers, json=body)
         if response.status_code == 202:
-            print(f"✅ Copia iniciada: '{original_name}' ➜ '{copy_name}'")
+            print(f"✅ Copia iniciada: '{template_name}' ➜ '{copy_template_name}'")
         else:
             raise Exception(
                 f"❌ Error al copiar archivo: {response.status_code} - {response.text}"
