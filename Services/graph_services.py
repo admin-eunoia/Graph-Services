@@ -80,7 +80,8 @@ class GraphServices:
         drive_item = self._upload_bytes_fail(dest_path, out_buf.getvalue())
         return drive_item
 
-        
+
+        # -------------------------- Funciones de Excel (No se utilizan por el momento) ---------------------- #
     def copy_excel(self, name) -> None:
         """
         Copia un archivo Excel en OneDrive.
