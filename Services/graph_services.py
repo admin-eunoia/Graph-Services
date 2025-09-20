@@ -91,9 +91,9 @@ class GraphServices:
         """
         headers = self.auth.get_headers()
 
-        template_name = get_template_name()
+        """template_name = get_template_name()
         copy_template_name = get_copy_template_name()
-        folder_path = get_folder_path()
+        folder_path = get_folder_path()"""
 
         ruta_archivo_origen = f"{folder_path}/{template_name}"
         folder_id = self.auth.get_folder_id(folder_path)
