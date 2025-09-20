@@ -10,7 +10,90 @@ class GraphServices():
         self.user_id = user_id or self.auth.user_id
         self.graph_url = "https://graph.microsoft.com/v1.0"
         
-        
+    # graph_services_extend.py
+from typing import Optional, Dict, Any
+from io import BytesIO
+import requests
+
+from Auth.Microsoft_Graph_Auth import MicrosoftGraphAuthenticator
+from excel_render import fill_cells_in_memory, EXCEL_MIME
+
+
+class GraphServices:
+    def __init__(self, user_id: Optional[str] = None):
+        self.auth = MicrosoftGraphAuthenticator()
+        self.user_id = user_id or self.auth.user_id
+        self.graph_url = "https://graph.microsoft.com/v1.0"
+
+    # -------------------------- Helpers internos (Graph) -------------------------- #
+    def _join_path(self, folder_path: str, file_name: str) -> str:
+        """Une carpeta + archivo al formato que Graph espera en root:/...:/content."""
+        return f"{folder_path.strip('/')}/{file_name}"
+
+    def _download_file_bytes(self, full_path: str) -> bytes:
+        """
+        Descarga el contenido binario de un archivo en OneDrive usando ruta relativa.
+        full_path: 'Carpeta/Subcarpeta/Archivo.xlsx'
+        """
+        headers = self.auth.get_headers()
+        url = f"{self.graph_url}/users/{self.user_id}/drive/root:/{full_path}:/content"
+        resp = requests.get(url, headers=headers, timeout=60)
+        if resp.status_code != 200:
+            raise Exception(f"❌ Error al descargar '{full_path}': {resp.status_code} - {resp.text}")
+        return resp.content
+
+    def _upload_bytes_fail(self, full_dest_path: str, file_bytes: bytes) -> Dict[str, Any]:
+        """
+        Sube bytes a OneDrive con conflictBehavior=fail (no sobrescribe si existe).
+        Retorna el driveItem (JSON).
+        """
+        headers = self.auth.get_headers().copy()
+        headers["Content-Type"] = EXCEL_MIME
+        url = (
+            f"{self.graph_url}/users/{self.user_id}/drive/root:/{full_dest_path}"
+            f":/content?@microsoft.graph.conflictBehavior=fail"
+        )
+        resp = requests.put(url, headers=headers, data=file_bytes, timeout=60)
+        if not (200 <= resp.status_code < 300):
+            raise Exception(f"❌ Error al subir '{full_dest_path}': {resp.status_code} - {resp.text}")
+        return resp.json()
+
+    # -------------------------- Método público (orquestador) ---------------------- #
+    def fill_excel_from_template(
+        self,
+        *,
+        template_folder_path: str,
+        template_file_name: str,
+        dest_folder_path: str,
+        dest_file_name: str,
+        data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        1) Descarga el template (.xlsx) desde OneDrive (RAM)
+        2) Rellena celdas en RAM con openpyxl
+        3) Sube el archivo final a OneDrive con conflictBehavior=fail
+
+        :param template_folder_path: Carpeta del template (p.ej. "Templates")
+        :param template_file_name:   Archivo de template (p.ej. "Factura.xlsx")
+        :param dest_folder_path:     Carpeta destino (p.ej. "Clientes/Acme")
+        :param dest_file_name:       Archivo destino (p.ej. "Factura_123.xlsx")
+        :param data:                 {"A1": 10, "Hoja1!B3": "ACME", ...}
+        :return:                     driveItem JSON (incluye webUrl)
+        """
+        # 1) Descargar template
+        template_path = self._join_path(template_folder_path, template_file_name)
+        template_bytes = self._download_file_bytes(template_path)
+
+        # 2) Rellenar en memoria
+        out_buf: BytesIO = fill_cells_in_memory(template_bytes, data)
+
+        # 3) Subir a destino con fail (no sobrescribe si existe)
+        dest_path = self._join_path(dest_folder_path, dest_file_name)
+        drive_item = self._upload_bytes_fail(dest_path, out_buf.getvalue())
+        return drive_item
+
+
+
     def copy_excel(self, original_name: str, copy_name: str, folder_path: str) -> None:
         """
         Copia un archivo Excel en OneDrive.
