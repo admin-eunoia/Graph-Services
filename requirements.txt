@@ -1,3 +1,9 @@
-msal
-requests
+flask
 python-dotenv
+sqlalchemy
+psycopg2-binary
+msal
+openpyxl
+requests
+pytest
+flask-limiter
