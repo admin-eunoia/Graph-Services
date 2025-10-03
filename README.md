@@ -1,15 +1,35 @@
-# Graph API – Autenticación y Servicios de Excel
+# Graph Services API
 
-Este proyecto expone dos clases principales:
+Flask API que automatiza la generación y edición de archivos Excel sobre Microsoft Graph. Incluye:
 
-- `MicrosoftGraphAuthenticator` en `Microsoft_Graph_Auth.py`: gestiona la autenticación (MSAL) y ayuda a resolver IDs de archivos/carpetas.
-- `GraphServices` en `graph_services.py`: ofrece servicios de `copy_excel` y `fill_excel` sobre Microsoft Graph.
+- Autenticación MSAL per tenant con `MicrosoftGraphAuthenticator` (`Auth/Microsoft_Graph_Auth.py`).
+- Cliente de alto nivel `GraphServices` (`Services/graph_services.py`) con reintentos y telemetría.
+- Validaciones de payload (`validators/payload.py`) y modelos SQLAlchemy para la persistencia de configuración (`Postgress/Tables.py`).
 
 ## Requisitos
 
-- Python 3.9+
-- Tener una app registrada en Azure AD con permisos de Microsoft Graph adecuados.
-- Variables de entorno configuradas.
+- Python 3.10+
+- PostgreSQL accesible con credenciales creadas.
+- Aplicación registrada en Azure AD con permisos de Microsoft Graph para OneDrive/Excel.
+
+## Variables de entorno
+
+Configura un archivo `.env` en la raíz con los valores necesarios:
+
+```env
+FLASK_SECRET_KEY=super-secret
+PORT=8000
+RATE_LIMITS="120 per minute; 5000 per hour"
+TRUSTED_API_KEY=opcional-para-saltar-rate-limit
+
+DB_USER=postgres
+DB_PASSWORD=postgres
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=graph_services
+```
+
+Las credenciales de Microsoft Graph se almacenan por tenant en la tabla `tenant_credentials`, por lo que no se necesitan aquí, pero deben existir en la base de datos antes de consumir el servicio.
 
 ## Instalación
 
@@ -19,103 +39,75 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Copia `.env.example` a `.env` y completa tus credenciales:
+Inicializa la base de datos y arranca la aplicación:
 
 ```bash
-cp .env.example .env
+python main.py
 ```
 
-Edita `.env` con tus valores reales.
+Al iniciar, se crea el esquema público en PostgreSQL (si no existe), se generan las tablas declaradas y se aplican límites de tasa configurables mediante `flask-limiter`.
 
-## Uso rápido
+## Endpoints
 
-Ejecuta el ejemplo de uso:
+Todas las rutas están bajo el prefijo `/graph`.
+
+### `POST /graph/excel/render-upload`
+
+1. Valida el payload (`client_key`, `template_key`, `tenant_name`, `data`, opcional `naming` y selectores de destino).
+2. Obtiene las credenciales y definición de template/almacenamiento desde PostgreSQL.
+3. Descarga el template de OneDrive (drive o usuario) y lo rellena en memoria.
+4. Construye el nombre final mediante `dest_file_pattern` y sube el archivo rellenado.
+5. Registra el resultado en `render_logs`, incluyendo duración, request IDs de Microsoft y URL generada.
+
+Payload mínimo de ejemplo:
+
+```json
+{
+  "client_key": "demo",
+  "template_key": "reporte-mensual",
+  "tenant_name": "Contoso",
+  "data": {
+    "A1": "Contoso",
+    "Resumen!B3": 42
+  }
+}
+```
+
+### `POST /graph/excel/write-cells`
+
+Actualiza celdas en un archivo existente sin pasar por un template:
+
+1. Valida que `dest_file_name` termine en `.xlsx` y el mapa de celdas.
+2. Resuelve la ubicación del archivo en Graph (drive o usuario) a partir de la configuración en PostgreSQL.
+3. Para cada celda hace `PATCH` vía Graph Excel API, acumulando los request IDs y resultados (`ok`/`error`).
+4. Guarda un log con `template_key="__manual_write__"` y los datos utilizados.
+
+Si alguna celda falla, responde con `207 Multi-Status` para que el cliente pueda inspeccionar qué direcciones fallaron.
+
+## Estructura de la base de datos
+
+`Postgress/Tables.py` define las entidades principales:
+
+- `TenantCredentials`: credenciales y metadatos por cliente.
+- `TenantUsers`: aliases de usuarios impersonados.
+- `StorageTargets`: destino en OneDrive/Drive para cada combinación (cliente, usuario, ubicación).
+- `Templates`: describe carpetas, archivo base, patrón de nombres y comportamiento de conflicto.
+- `RenderLogs`: historial de ejecuciones, duración, estado y errores.
+
+Cada endpoint abre una sesión SQLAlchemy por request (`main.py`) y delega el commit/rollback al `teardown_request`.
+
+## Validaciones y helpers
+
+- `validators/payload.py` centraliza longitudes máximas, sanitización de nombres, validación de `location_type` (`drive`/`user`) y construcción del nombre final.
+- `Services/excel_render.py` usa `openpyxl` para rellenar workbooks en memoria, teniendo en cuenta celdas combinadas.
+- `GraphServices` encapsula llamadas HTTP (`requests`), añade reintentos exponenciales para códigos 423/429/50x y registra los `request-id` de Microsoft en las respuestas.
+
+## Desarrollo
+
+- Ejecuta pruebas unitarias con `pytest` (si agregas tests):
 
 ```bash
-python example_usage.py
+pytest
 ```
 
-O bien, usa las clases directamente:
-
-```python
-from graph_services import GraphServices
-
-services = GraphServices()  # usa el user_id por defecto del autenticador
-
-# 1) Copiar un Excel dentro de una carpeta
-services.copy_excel(
-    original_name="Plantilla.xlsx",
-    copy_name="MiCopia.xlsx",
-    folder_path="Documentos/Proyectos",
-)
-
-# 2) Escribir datos en celdas de un Excel existente
-services.fill_excel(
-    file_path="Documentos/Proyectos/MiCopia.xlsx",
-    worksheet_name="Hoja1",
-    data={
-        "A1": "Juan",
-        "A2": 30,
-        "A3": "M",
-        "A4": "Ingeniero",
-    },
-)
-
-# 3) Crear un Excel vacío en una carpeta
-services.create_excel("NuevoArchivo.xlsx", folder_path="Documentos/Proyectos")
-
-# 4) Listar Excels en una carpeta
-print(services.list_excels("Documentos/Proyectos"))
-
-# 5) Añadir y eliminar hojas
-services.add_worksheet("Documentos/Proyectos/NuevoArchivo.xlsx", "Datos")
-services.delete_worksheet("Documentos/Proyectos/NuevoArchivo.xlsx", "Datos")
-
-# 6) Escribir un rango (matriz 2D) comenzando en A1
-services.write_range(
-    file_path="Documentos/Proyectos/MiCopia.xlsx",
-    worksheet_name="Hoja1",
-    start_cell="B5",
-    values_2d=[["Producto", "Precio"], ["A", 10], ["B", 20]],
-)
-
-# 7) Leer celdas múltiples con batch
-vals = services.read_cells(
-    file_path="Documentos/Proyectos/MiCopia.xlsx",
-    worksheet_name="Hoja1",
-    cells=["A1", "B2", "B5"],
-)
-print(vals)
-
-# 8) Crear tabla y agregar filas
-services.create_table(
-    file_path="Documentos/Proyectos/MiCopia.xlsx",
-    worksheet_name="Hoja1",
-    range_address="B5:C7",  # Debe cubrir encabezados + filas iniciales
-    table_name="TablaProductos",
-    has_headers=True,
-)
-services.add_table_rows(
-    file_path="Documentos/Proyectos/MiCopia.xlsx",
-    table_name="TablaProductos",
-    rows=[["C", 30], ["D", 40]],
-)
-
-# 9) Eliminar un Excel
-services.delete_excel("Documentos/Proyectos/NuevoArchivo.xlsx")
-```
-
-## Notas
-
-- La operación de copia (`/copy`) devuelve `202 Accepted`; Microsoft Graph realiza la copia en segundo plano. Si necesitas confirmar finalización, deberás consultar el estado del trabajo usando el header `Location` que retorna ese endpoint.
-- Asegúrate de que el `user_id` tenga acceso al archivo/carpeta objetivo en OneDrive.
-- La creación de un Excel vacío genera un archivo mínimo válido (ZIP estructurado) para poder subirlo directamente vía `PUT /content`.
-- Operaciones batch para lectura de múltiples celdas reducen el número de llamadas individuales.
-- No puedes eliminar la última hoja de un workbook; Graph devolverá error.
-- Para tablas: el `range_address` debe incluir encabezados si `has_headers=True`.
-
-## Variables de entorno esperadas
-
-- `MICROSOFT_CLIENT_ID`
-- `MICROSOFT_CLIENT_SECRET`
-- `MICROSOFT_TENANT_ID`
+- Mantén las configuraciones sensibles fuera del repositorio y usa Azure Key Vault u otro mecanismo seguro para los secretos de clientes.

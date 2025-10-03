@@ -35,10 +35,3 @@ def init_db():
     )
     Base.metadata.create_all(bind=engine)
 
-def _db_session():
-    """Generador de sesión para usar en routes.py (next(db_ctx))."""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()

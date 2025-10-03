@@ -2,11 +2,13 @@ import time
 import re
 from typing import Optional, Dict, Any, Tuple
 import requests
+from requests import exceptions as requests_exceptions
 from urllib.parse import quote
 from Services.excel_render import fill_cells_in_memory, EXCEL_MIME
+from validators.payload import validate_cell_map_or_raise
 
 # -----------------------------
-# Public validator (used by routes)
+# Validadores compartidos
 # -----------------------------
 _CELL_RE = re.compile(r"^(?:([^!]+)!)?([A-Za-z]+[1-9][0-9]*)$")  # [sheet!]ColRow
 
@@ -24,21 +26,6 @@ class GraphAPIError(Exception):
         if self.ms_request_id:
             return f"{base} (status={self.status_code}, ms-request-id={self.ms_request_id})"
         return f"{base} (status={self.status_code})"
-
-def validate_cell_map_or_raise(data: Dict[str, Any]) -> None:
-    """
-    Validates that each key is 'A1' or 'Sheet!A1' and each value is a simple JSON-serializable scalar.
-    Raises ValueError with a clear message if invalid.
-    """
-    if not isinstance(data, dict) or not data:
-        raise ValueError("data debe ser un diccionario no vacío de {celda: valor}.")
-
-    for k, v in data.items():
-        if not isinstance(k, str) or not _CELL_RE.match(k):
-            raise ValueError(f"Dirección de celda inválida: '{k}'. Usa 'A1' o 'Hoja!B2'.")
-        # Basic value sanity: allow str/int/float/bool/None
-        if not (isinstance(v, (str, int, float, bool)) or v is None):
-            raise ValueError(f"Valor no soportado para '{k}': {type(v).__name__}")
 
 # -----------------------------
 # Core Graph client with retry
@@ -60,15 +47,7 @@ class GraphServices:
         return h
 
     # ---------- low-level request with retry/backoff ----------
-    def _request_with_retry(
-        self,
-        method: str,
-        url: str,
-        *,
-        expected: Tuple[int, ...] = (200, 201, 204),
-        headers: Optional[Dict[str, str]] = None,
-        **kwargs
-    ) -> Tuple[requests.Response, Optional[str]]:
+    def _request_with_retry(self, method: str, url: str, *, expected: Tuple[int, ...] = (200, 201, 204), headers: Optional[Dict[str, str]] = None, **kwargs) -> Tuple[requests.Response, Optional[str]]:
         """
         Centralized HTTP call with:
           - exponential backoff on 423/429/502/503/504
@@ -81,9 +60,17 @@ class GraphServices:
         last_ms_req_id = None
 
         resp: Optional[requests.Response] = None
+        last_exception: Optional[requests_exceptions.RequestException] = None
 
         for attempt in range(1, max_attempts + 1):
-            resp = requests.request(method, url, headers=hdrs, timeout=60, **kwargs)
+            try:
+                resp = requests.request(method, url, headers=hdrs, timeout=60, **kwargs)
+                last_exception = None
+            except requests_exceptions.RequestException as exc:
+                last_exception = exc
+                delay = base_delay * attempt
+                time.sleep(delay)
+                continue
             last_ms_req_id = resp.headers.get("request-id") or resp.headers.get("x-ms-request-id")
 
             if resp.status_code in expected:
@@ -119,6 +106,12 @@ class GraphServices:
                 ms_request_id=last_ms_req_id,
                 response_body=resp.text,
             )
+        if last_exception is not None:
+            raise GraphAPIError(
+                status_code=0,
+                message=f"Error de red al contactar Graph: {last_exception}",
+                ms_request_id=last_ms_req_id,
+            ) from last_exception
         raise GraphAPIError(status_code=500, message="Max retries exceeded", ms_request_id=last_ms_req_id)
 
     # ---------- high-level helpers ----------
@@ -134,8 +127,7 @@ class GraphServices:
         resp, ms_id = self._request_with_retry("GET", url, expected=(200,), headers=self._headers())
         return resp.content, ms_id
 
-    def upload_file_bytes(self, file_bytes: bytes, dest_path: str, conflict_behavior: str = "fail",
-                          target_user_id: str = None, drive_id: str = None) -> Tuple[dict, Optional[str]]:
+    def upload_file_bytes(self, file_bytes: bytes, dest_path: str, conflict_behavior: str = "fail", target_user_id: str = None, drive_id: str = None) -> Tuple[dict, Optional[str]]:
         dest_path_enc = "/".join(quote(p) for p in dest_path.split("/"))
         if drive_id:
             url = f"{self.graph_url}/drives/{drive_id}/root:/{dest_path_enc}:/content?@microsoft.graph.conflictBehavior={conflict_behavior}"
@@ -193,6 +185,7 @@ class GraphServices:
                     "http_status": None,
                 }
                 continue
+
             sheet_name, addr = m.group(1), m.group(2)
             ws_id = by_name.get(sheet_name) if sheet_name else default_ws_id
             if not ws_id:
@@ -209,10 +202,13 @@ class GraphServices:
                 base = f"{self.graph_url}/users/{target_user_id}/drive/items/{item_id}"
 
             url = f"{base}/workbook/worksheets/{ws_id}/range(address='{addr}')"
-            body = {"values": [[value]]}
             try:
                 resp, ms_patch_id = self._request_with_retry(
-                    "PATCH", url, expected=(200,), headers=self._headers(), json=body
+                    "PATCH",
+                    url,
+                    expected=(200,),
+                    headers=self._headers(),
+                    json={"values": [[value]]},
                 )
                 ms_ids_accum[f"patch_{key}"] = ms_patch_id
                 results[key] = {"status": "ok"}
