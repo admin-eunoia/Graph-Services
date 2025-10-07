@@ -5,7 +5,6 @@ import requests
 from requests import exceptions as requests_exceptions
 from urllib.parse import quote
 from Services.excel_render import fill_cells_in_memory, EXCEL_MIME
-from validators.payload import validate_cell_map_or_raise
 
 # -----------------------------
 # Validadores compartidos

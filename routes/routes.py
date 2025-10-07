@@ -1,5 +1,6 @@
 # routes/routes.py
 import time
+import json
 from datetime import datetime
 from typing import Optional, Tuple
 from flask import Blueprint, request, jsonify
@@ -338,8 +339,8 @@ def write_cells():
             "dest_file_name": "reporte-abril.xlsx",
             "data": {
             "A1": "Contoso S.A.",
-            "Resumen!B3": 12850,
-            "Resumen!C4": "OK"
+            "Hoja1!B3": 12850,
+            "Hoja1!C4": "OK"
             },
             "target_alias": "finance",                              opcional
             "location_type": "user",                                opcional
@@ -467,8 +468,17 @@ def write_cells():
         )
 
         written = result.get("written", {})
-        success_cells = [cell for cell, info in written.items() if info.get("status") == "ok"]
         error_cells = {cell: info for cell, info in written.items() if info.get("status") == "error"}
+
+        log_status = RenderStatus.SUCCESS if not error_cells else RenderStatus.ERROR
+        error_summary = None
+        if error_cells:
+            try:
+                error_summary = json.dumps(error_cells)
+            except Exception:
+                error_summary = str(error_cells)
+            if error_summary and len(error_summary) > 1000:
+                error_summary = error_summary[:997] + "..."
 
         # Log (sin template_id porque es edición directa)
         duration_ms = int((time.perf_counter() - t0) * 1000)
@@ -477,11 +487,12 @@ def write_cells():
             template_id=None,  # importante: None, no 0
             template_key="__manual_write__",
             data_json=body["data"],
-            status=RenderStatus.SUCCESS,
+            status=log_status,
             requested_by=body.get("requested_by", "eco-agent"),
             created_at=datetime.utcnow(),
             duration_ms=duration_ms,
-            dest_file_name=body["dest_file_name"]
+            dest_file_name=body["dest_file_name"],
+            error_message=error_summary,
         )
         db.add(log_row)
         # db.commit()  # opcional; tu teardown ya hace commit si no hay excepción
@@ -547,6 +558,4 @@ def write_cells():
             pass
 
         return jsonify({"error": str(e), "correlation_id": corr_id}), 500
-    err = validate_string_field("tenant_name", body.get("tenant_name"), max_length=MAX_TENANT_NAME_LENGTH)
-    if err:
-        return jsonify({"error": err}), 400
+ 
