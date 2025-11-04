@@ -84,6 +84,7 @@ class Templates(Base):
     dest_file_pattern = Column(String(255), nullable=False)
     default_conflict_behavior = Column(String(10), default="fail")
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    cell_mapping = Column(JSON, nullable=True)
     
 
 class RenderLogs(Base):

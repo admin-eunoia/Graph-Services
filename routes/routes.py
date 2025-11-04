@@ -78,9 +78,9 @@ def render_upload():
         -H "Content-Type: application/json" 
         -H "X-Api-Key: opcional-si-quieres-saltar-rate-limit" 
         -d '{
-            "client_key": "contoso",
-            "template_key": "reporte-mensual",
-            "tenant_name": "Contoso S.A.",
+            "client_key": "eunoia",
+            "template_key": "waman_prueba",
+            "tenant_name": "Eunoia",
             "data": {
             "A1": "Contoso",
             "Hoja1!B3": 42,
@@ -558,4 +558,192 @@ def write_cells():
             pass
 
         return jsonify({"error": str(e), "correlation_id": corr_id}), 500
- 
+
+
+@graph_bp.post("/excel/read-cells")
+def read_cells():
+    """
+    Permite verificar que un archivo Excel en el destino contiene los valores esperados.
+    El agente envía la ubicación del archivo y el json `cell_mapping_fill` con los valores
+    esperados; la ruta compara contra el contenido actual del workbook.
+    """
+    body = request.get_json() or {}
+    err = require_fields(body, ["client_key", "tenant_name", "dest_file_name", "cell_mapping_fill"])
+    if err:
+        return jsonify({"error": err}), 400
+
+    err = validate_string_field("client_key", body.get("client_key"), max_length=MAX_CLIENT_FIELD_LENGTH)
+    if err:
+        return jsonify({"error": err}), 400
+
+    err = validate_string_field("tenant_name", body.get("tenant_name"), max_length=MAX_TENANT_NAME_LENGTH)
+    if err:
+        return jsonify({"error": err}), 400
+
+    err = validate_string_field("dest_file_name", body.get("dest_file_name"), max_length=MAX_DEST_FILE_NAME_LENGTH)
+    if err:
+        return jsonify({"error": err}), 400
+
+    expected_cells = body.get("cell_mapping_fill")
+    if not isinstance(expected_cells, dict):
+        return jsonify({"error": "cell_mapping_fill debe ser un diccionario"}), 400
+
+    err = validate_data_dict(expected_cells)
+    if err:
+        return jsonify({"error": err}), 400
+
+    try:
+        validate_cell_map_or_raise(expected_cells)
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+
+    dest_file_name = body["dest_file_name"].strip()
+    if any(sep in dest_file_name for sep in ("/", "\\")) or dest_file_name.startswith(".") or ".." in dest_file_name:
+        return jsonify({"error": "dest_file_name inválido"}), 400
+    if not dest_file_name.lower().endswith(".xlsx"):
+        return jsonify({"error": "dest_file_name debe terminar en .xlsx"}), 400
+    body["dest_file_name"] = dest_file_name
+
+    target_alias = body.get("target_alias")
+    if target_alias is not None:
+        err = validate_string_field("target_alias", target_alias, max_length=MAX_TARGET_ALIAS_LENGTH)
+        if err:
+            return jsonify({"error": err}), 400
+        alias_clean = target_alias.strip()
+        if alias_clean and not ALLOWED_IDENTIFIER_RE.match(alias_clean):
+            return jsonify({"error": "target_alias contiene caracteres no permitidos"}), 400
+        body["target_alias"] = alias_clean or None
+
+    loc_err, (normalized_type, ident_clean) = validate_location_selector(
+        body.get("location_type"), body.get("location_identifier")
+    )
+    if loc_err:
+        return jsonify({"error": loc_err}), 400
+    body["location_type"] = normalized_type
+    body["location_identifier"] = ident_clean
+
+    corr_id = new_correlation_id()
+    t0 = time.perf_counter()
+
+    db = request.environ.get("db_session")
+
+    try:
+        creds = (
+            db.query(TenantCredentials)
+            .filter_by(client_key=body["client_key"], enabled=True)
+            .first()
+        )
+        if not creds:
+            return jsonify({"error": "Configuración incompleta en DB"}), 400
+
+        storage_query = (
+            db.query(StorageTargets)
+            .filter_by(client_key=body["client_key"], tenant_id=creds.id)
+        )
+        target_alias = body.get("target_alias")
+        location_type = body.get("location_type")
+        location_identifier = body.get("location_identifier")
+        tenant_user = None
+        if target_alias:
+            tenant_user = (
+                db.query(TenantUsers)
+                .filter_by(tenant_id=creds.id, alias=target_alias)
+                .first()
+            )
+            if not tenant_user:
+                return jsonify({"error": f"target_alias '{target_alias}' no está configurado"}), 400
+            storage = storage_query.filter_by(tenant_user_id=tenant_user.id).first()
+            if not storage:
+                return jsonify({"error": f"No hay destino configurado para el alias '{target_alias}'"}), 400
+        else:
+            if location_type and location_identifier:
+                storage = (
+                    storage_query
+                    .filter_by(location_type=location_type, location_identifier=location_identifier)
+                    .first()
+                )
+                if not storage:
+                    return jsonify({"error": "No hay destino configurado para la ubicación indicada"}), 400
+            else:
+                storage = storage_query.first()
+
+        if not storage:
+            return jsonify({"error": "Configuración incompleta en DB"}), 400
+
+        auth = MicrosoftGraphAuthenticator(
+            creds.tenant_id, creds.app_client_id, creds.app_client_secret
+        )
+        token = auth.get_access_token()
+        gs = GraphServices(access_token=token, correlation_id=corr_id)
+
+        full_dest_path = _join_storage_path(
+            storage.default_dest_folder_path,
+            body["dest_file_name"],
+        )
+
+        drive_id, target_user_graph_id = _resolve_graph_target(storage)
+
+        read_result, ms_ids = gs.read_cells_graph(
+            full_dest_path=full_dest_path,
+            cells=list(expected_cells.keys()),
+            target_user_id=target_user_graph_id,
+            drive_id=drive_id,
+        )
+
+        verification = {}
+        mismatches = {}
+        cells_info = read_result.get("cells", {})
+        for cell, info in cells_info.items():
+            expected_value = expected_cells.get(cell)
+            cell_entry = {
+                "status": info.get("status"),
+                "expected": expected_value,
+                "actual": info.get("value"),
+            }
+            if info.get("status") == "ok":
+                matches = info.get("value") == expected_value
+                cell_entry["matches"] = matches
+                if not matches:
+                    mismatches[cell] = {
+                        "expected": expected_value,
+                        "actual": info.get("value"),
+                    }
+            else:
+                cell_entry["message"] = info.get("message")
+                cell_entry["http_status"] = info.get("http_status")
+                if info.get("ms_request_id"):
+                    cell_entry["ms_request_id"] = info.get("ms_request_id")
+                mismatches[cell] = {
+                    "expected": expected_value,
+                    "error": info.get("message"),
+                    "http_status": info.get("http_status"),
+                }
+            verification[cell] = cell_entry
+
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        all_match = not mismatches
+
+        response_payload = {
+            "message": "OK" if all_match else "Differences detected",
+            "matches_all": all_match,
+            "verification": verification,
+            "mismatches": mismatches,
+            "correlation_id": corr_id,
+            "duration_ms": duration_ms,
+            "ms_request_ids": ms_ids,
+        }
+
+        return jsonify(response_payload), 200
+
+    except GraphAPIError as ge:
+        status = ge.status_code if 400 <= (ge.status_code or 0) <= 599 else 502
+        payload = {
+            "error": ge.message,
+            "correlation_id": corr_id,
+        }
+        if ge.ms_request_id:
+            payload["ms_request_id"] = ge.ms_request_id
+        return jsonify(payload), status
+
+    except Exception as e:
+        return jsonify({"error": str(e), "correlation_id": corr_id}), 500

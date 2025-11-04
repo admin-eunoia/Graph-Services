@@ -1,6 +1,6 @@
 import time
 import re
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 import requests
 from requests import exceptions as requests_exceptions
 from urllib.parse import quote
@@ -232,3 +232,78 @@ class GraphServices:
     def render_in_memory(self, template_bytes: bytes, data: dict) -> bytes:
         out = fill_cells_in_memory(template_bytes, data)
         return out.getvalue()
+
+    def read_cells_graph(self, *, full_dest_path: str, cells: List[str], target_user_id: str = None, drive_id: str = None) -> Tuple[dict, Dict[str, Optional[str]]]:
+        """
+        Lee los valores actuales de un rango discreto de celdas y devuelve tanto los valores
+        como los ids de solicitud de Graph para trazabilidad.
+        """
+        item_id, ms_resolve_id = self._resolve_item_id(full_dest_path, target_user_id=target_user_id, drive_id=drive_id)
+        sheets, ms_ws_id = self._resolve_worksheets(item_id=item_id, target_user_id=target_user_id, drive_id=drive_id)
+        if not sheets:
+            raise Exception("El workbook no tiene hojas.")
+
+        by_name = {s.get("name"): s.get("id") for s in sheets}
+        default_ws_id = sheets[0]["id"]
+        ms_ids_accum: Dict[str, Optional[str]] = {"resolve_item": ms_resolve_id, "list_sheets": ms_ws_id}
+        results: Dict[str, Dict[str, Any]] = {}
+
+        for cell in cells:
+            m = _CELL_RE.match(cell)
+            if not m:
+                results[cell] = {
+                    "status": "error",
+                    "message": "Dirección inválida",
+                    "http_status": None,
+                }
+                continue
+
+            sheet_name, addr = m.group(1), m.group(2)
+            ws_id = by_name.get(sheet_name) if sheet_name else default_ws_id
+            if not ws_id:
+                results[cell] = {
+                    "status": "error",
+                    "message": f"Hoja '{sheet_name}' no encontrada",
+                    "http_status": 404,
+                }
+                continue
+
+            if drive_id:
+                base = f"{self.graph_url}/drives/{drive_id}/items/{item_id}"
+            else:
+                base = f"{self.graph_url}/users/{target_user_id}/drive/items/{item_id}"
+
+            url = f"{base}/workbook/worksheets/{ws_id}/range(address='{addr}')"
+            try:
+                resp, ms_get_id = self._request_with_retry(
+                    "GET",
+                    url,
+                    expected=(200,),
+                    headers=self._headers(),
+                )
+                ms_ids_accum[f"get_{cell}"] = ms_get_id
+                payload = resp.json()
+                values = payload.get("values", [])
+                value = None
+                if isinstance(values, list) and values:
+                    first_row = values[0]
+                    if isinstance(first_row, list) and first_row:
+                        value = first_row[0]
+
+                results[cell] = {"status": "ok", "value": value}
+            except GraphAPIError as ge:
+                ms_ids_accum[f"get_{cell}"] = ge.ms_request_id
+                results[cell] = {
+                    "status": "error",
+                    "message": ge.message,
+                    "http_status": ge.status_code,
+                    "ms_request_id": ge.ms_request_id,
+                }
+            except Exception as err:
+                results[cell] = {
+                    "status": "error",
+                    "message": str(err),
+                    "http_status": None,
+                }
+
+        return {"cells": results}, ms_ids_accum
