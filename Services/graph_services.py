@@ -10,6 +10,28 @@ from Services.excel_render import fill_cells_in_memory, EXCEL_MIME
 # Validadores compartidos
 # -----------------------------
 _CELL_RE = re.compile(r"^(?:([^!]+)!)?([A-Za-z]+[1-9][0-9]*)$")  # [sheet!]ColRow
+_COL_LETTERS_RE = re.compile(r"^[A-Za-z]+$")
+
+
+def _col_letters_to_index(letters: str) -> int:
+    """Convert column letters (e.g., 'A', 'AA') to 1-based index."""
+    val = 0
+    for ch in letters.upper():
+        if not ("A" <= ch <= "Z"):
+            raise ValueError("Invalid column letters")
+        val = val * 26 + (ord(ch) - ord("A") + 1)
+    return val
+
+
+def _col_index_to_letters(idx: int) -> str:
+    """Convert 1-based column index to letters (e.g., 1 -> 'A')."""
+    if idx < 1:
+        raise ValueError("Column index must be >= 1")
+    letters = []
+    while idx:
+        idx, rem = divmod(idx - 1, 26)
+        letters.append(chr(rem + ord("A")))
+    return "".join(reversed(letters))
 
 
 class GraphAPIError(Exception):
@@ -307,3 +329,136 @@ class GraphServices:
                 }
 
         return {"cells": results}, ms_ids_accum
+
+    def insert_rows_graph(
+        self,
+        *,
+        full_dest_path: str,
+        start_cell: str,
+        rows: Optional[List[List[Any]]] = None,
+        row_count: Optional[int] = None,
+        target_user_id: str = None,
+        drive_id: str = None,
+        shift: str = "Down",
+        merge_ranges: Optional[List[str]] = None,
+    ) -> Tuple[dict, Dict[str, Optional[str]]]:
+        """
+        Inserta filas a partir de start_cell (ej: A2 o Hoja1!A2) desplazando celdas existentes.
+        Si se proveen rows, escribe esos valores en el rango insertado.
+        Si no, solo inserta filas en blanco conservando el formato desplazado.
+        merge_ranges (opcional) puede incluir rangos con el placeholder "{row}" que se reemplaza
+        por cada fila insertada para re-aplicar merges por fila.
+        """
+        m = _CELL_RE.match(start_cell)
+        if not m:
+            raise ValueError("start_cell inválido; use 'A2' o 'Hoja!A2'")
+
+        sheet_name, addr = m.group(1), m.group(2)  # addr = e.g., A2
+        col_part = "".join(ch for ch in addr if ch.isalpha())
+        row_part = "".join(ch for ch in addr if ch.isdigit())
+        if not col_part or not row_part:
+            raise ValueError("start_cell inválido; debe contener columna y fila")
+        start_col_idx = _col_letters_to_index(col_part)
+        start_row_idx = int(row_part)
+
+        if rows is not None:
+            rc = len(rows)
+            cc = max((len(r) for r in rows), default=0)
+            if rc == 0 or cc == 0:
+                raise ValueError("rows debe tener al menos una fila con valores o row_count > 0")
+            row_count_final = rc
+            col_count_final = cc
+        else:
+            if not row_count or row_count <= 0:
+                raise ValueError("row_count debe ser > 0 cuando no se envían rows")
+            row_count_final = row_count
+            col_count_final = None  # se resolverá con usedRange
+
+        item_id, ms_resolve_id = self._resolve_item_id(full_dest_path, target_user_id=target_user_id, drive_id=drive_id)
+        sheets, ms_ws_id = self._resolve_worksheets(item_id=item_id, target_user_id=target_user_id, drive_id=drive_id)
+        if not sheets:
+            raise Exception("El workbook no tiene hojas.")
+        by_name = {s.get("name"): s.get("id") for s in sheets}
+        default_ws_id = sheets[0]["id"]
+        ws_id = by_name.get(sheet_name) if sheet_name else default_ws_id
+        if not ws_id:
+            raise Exception(f"Hoja '{sheet_name}' no encontrada.")
+
+        ms_ids_accum: Dict[str, Optional[str]] = {"resolve_item": ms_resolve_id, "list_sheets": ms_ws_id}
+
+        if drive_id:
+            base = f"{self.graph_url}/drives/{drive_id}/items/{item_id}"
+        else:
+            base = f"{self.graph_url}/users/{target_user_id}/drive/items/{item_id}"
+
+        if col_count_final is None:
+            try:
+                resp_used, ms_used_id = self._request_with_retry(
+                    "GET",
+                    f"{base}/workbook/worksheets/{ws_id}/usedRange",
+                    expected=(200,),
+                    headers=self._headers(),
+                )
+                ms_ids_accum["used_range"] = ms_used_id
+                used = resp_used.json() or {}
+                col_count_final = used.get("columnCount") or 1
+            except Exception:
+                col_count_final = 1
+
+        end_col_letters = _col_index_to_letters(start_col_idx + col_count_final - 1)
+        end_row_idx = start_row_idx + row_count_final - 1
+        range_addr = f"{col_part}{start_row_idx}:{end_col_letters}{end_row_idx}"
+        range_addr_full = f"{sheet_name}!{range_addr}" if sheet_name else range_addr
+
+        range_url = f"{base}/workbook/worksheets/{ws_id}/range(address='{range_addr_full}')"
+
+        resp_insert, ms_insert_id = self._request_with_retry(
+            "POST",
+            f"{range_url}/insert",
+            expected=(200,),
+            headers=self._headers(),
+            json={"shift": shift},
+        )
+        ms_ids_accum["insert"] = ms_insert_id
+
+        if rows is not None:
+            resp_write, ms_write_id = self._request_with_retry(
+                "PATCH",
+                range_url,
+                expected=(200,),
+                headers=self._headers(),
+                json={"values": rows},
+            )
+            ms_ids_accum["write"] = ms_write_id
+
+        # Reaplicar merges si se solicitaron
+        if merge_ranges:
+            merges_full = []
+            for r in merge_ranges:
+                if not isinstance(r, str) or "{row}" not in r and not any(ch.isdigit() for ch in r):
+                    raise ValueError("merge_ranges debe contener strings con '{row}' o filas numéricas")
+            for i in range(row_count_final):
+                row_num = start_row_idx + i
+                for template_range in merge_ranges:
+                    addr_merge = template_range.replace("{row}", str(row_num))
+                    full_addr = f"{sheet_name}!{addr_merge}" if sheet_name else addr_merge
+                    merges_full.append(full_addr)
+            for idx, addr_merge in enumerate(merges_full):
+                try:
+                    resp_merge, ms_merge_id = self._request_with_retry(
+                        "POST",
+                        f"{base}/workbook/worksheets/{ws_id}/range(address='{addr_merge}')/merge",
+                        expected=(200,),
+                        headers=self._headers(),
+                        json={"across": False},
+                    )
+                    ms_ids_accum[f"merge_{idx}"] = ms_merge_id
+                except Exception as err:
+                    ms_ids_accum[f"merge_{idx}"] = None
+
+        return {
+            "message": "OK",
+            "range": range_addr_full,
+            "rows_written": row_count_final,
+            "columns": col_count_final,
+        }, ms_ids_accum

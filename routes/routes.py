@@ -16,6 +16,7 @@ from Auth.Microsoft_Graph_Auth import MicrosoftGraphAuthenticator
 from Services.graph_services import GraphServices, GraphAPIError
 from validators.payload import (
     ALLOWED_IDENTIFIER_RE,
+    CELL_REF_RE,
     MAX_CLIENT_FIELD_LENGTH,
     MAX_TENANT_NAME_LENGTH,
     MAX_DEST_FILE_NAME_LENGTH,
@@ -733,6 +734,334 @@ def read_cells():
             "ms_request_ids": ms_ids,
         }
 
+        return jsonify(response_payload), 200
+
+    except GraphAPIError as ge:
+        status = ge.status_code if 400 <= (ge.status_code or 0) <= 599 else 502
+        payload = {
+            "error": ge.message,
+            "correlation_id": corr_id,
+        }
+        if ge.ms_request_id:
+            payload["ms_request_id"] = ge.ms_request_id
+        return jsonify(payload), status
+
+    except Exception as e:
+        return jsonify({"error": str(e), "correlation_id": corr_id}), 500
+
+
+
+@graph_bp.post("/excel/read-range")
+def read_range():
+    """
+    Lee valores de celdas específicas sin verificar contra valores esperados.
+    Envía una lista en "cells" y devuelve el valor/status de cada una.
+    """
+    body = request.get_json() or {}
+    err = require_fields(body, ["client_key", "tenant_name", "dest_file_name", "cells"])
+    if err:
+        return jsonify({"error": err}), 400
+
+    err = validate_string_field("client_key", body.get("client_key"), max_length=MAX_CLIENT_FIELD_LENGTH)
+    if err:
+        return jsonify({"error": err}), 400
+
+    err = validate_string_field("tenant_name", body.get("tenant_name"), max_length=MAX_TENANT_NAME_LENGTH)
+    if err:
+        return jsonify({"error": err}), 400
+
+    err = validate_string_field("dest_file_name", body.get("dest_file_name"), max_length=MAX_DEST_FILE_NAME_LENGTH)
+    if err:
+        return jsonify({"error": err}), 400
+
+    cells = body.get("cells")
+    if not isinstance(cells, list) or not cells:
+        return jsonify({"error": "cells debe ser una lista no vacía de direcciones"}), 400
+    for cell in cells:
+        if not isinstance(cell, str) or not CELL_REF_RE.match(cell):
+            return jsonify({"error": f"Dirección de celda inválida: '{cell}'. Usa 'A1' o 'Hoja!B2'."}), 400
+
+    dest_file_name = body["dest_file_name"].strip()
+    if any(sep in dest_file_name for sep in ("/", "\\")) or dest_file_name.startswith(".") or ".." in dest_file_name:
+        return jsonify({"error": "dest_file_name inválido"}), 400
+    if not dest_file_name.lower().endswith(".xlsx"):
+        return jsonify({"error": "dest_file_name debe terminar en .xlsx"}), 400
+    body["dest_file_name"] = dest_file_name
+
+    target_alias = body.get("target_alias")
+    if target_alias is not None:
+        err = validate_string_field("target_alias", target_alias, max_length=MAX_TARGET_ALIAS_LENGTH)
+        if err:
+            return jsonify({"error": err}), 400
+        alias_clean = target_alias.strip()
+        if alias_clean and not ALLOWED_IDENTIFIER_RE.match(alias_clean):
+            return jsonify({"error": "target_alias contiene caracteres no permitidos"}), 400
+        body["target_alias"] = alias_clean or None
+
+    loc_err, (normalized_type, ident_clean) = validate_location_selector(
+        body.get("location_type"), body.get("location_identifier")
+    )
+    if loc_err:
+        return jsonify({"error": loc_err}), 400
+    body["location_type"] = normalized_type
+    body["location_identifier"] = ident_clean
+
+    corr_id = new_correlation_id()
+    t0 = time.perf_counter()
+
+    db = request.environ.get("db_session")
+
+    try:
+        creds = (
+            db.query(TenantCredentials)
+            .filter_by(client_key=body["client_key"], enabled=True)
+            .first()
+        )
+        if not creds:
+            return jsonify({"error": "Configuración incompleta en DB"}), 400
+
+        storage_query = (
+            db.query(StorageTargets)
+            .filter_by(client_key=body["client_key"], tenant_id=creds.id)
+        )
+        target_alias = body.get("target_alias")
+        location_type = body.get("location_type")
+        location_identifier = body.get("location_identifier")
+        tenant_user = None
+        if target_alias:
+            tenant_user = (
+                db.query(TenantUsers)
+                .filter_by(tenant_id=creds.id, alias=target_alias)
+                .first()
+            )
+            if not tenant_user:
+                return jsonify({"error": f"target_alias '{target_alias}' no está configurado"}), 400
+            storage = storage_query.filter_by(tenant_user_id=tenant_user.id).first()
+            if not storage:
+                return jsonify({"error": f"No hay destino configurado para el alias '{target_alias}'"}), 400
+        else:
+            if location_type and location_identifier:
+                storage = (
+                    storage_query
+                    .filter_by(location_type=location_type, location_identifier=location_identifier)
+                    .first()
+                )
+                if not storage:
+                    return jsonify({"error": "No hay destino configurado para la ubicación indicada"}), 400
+            else:
+                storage = storage_query.first()
+
+        if not storage:
+            return jsonify({"error": "Configuración incompleta en DB"}), 400
+
+        auth = MicrosoftGraphAuthenticator(
+            creds.tenant_id, creds.app_client_id, creds.app_client_secret
+        )
+        token = auth.get_access_token()
+        gs = GraphServices(access_token=token, correlation_id=corr_id)
+
+        full_dest_path = _join_storage_path(
+            storage.default_dest_folder_path,
+            body["dest_file_name"],
+        )
+
+        drive_id, target_user_graph_id = _resolve_graph_target(storage)
+
+        read_result, ms_ids = gs.read_cells_graph(
+            full_dest_path=full_dest_path,
+            cells=cells,
+            target_user_id=target_user_graph_id,
+            drive_id=drive_id,
+        )
+
+        cells_info = read_result.get("cells", {})
+        error_cells = {cell: info for cell, info in cells_info.items() if info.get("status") != "ok"}
+
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        response_payload = {
+            "message": "OK" if not error_cells else "Partial",
+            "cells": cells_info,
+            "error_cells": error_cells,
+            "correlation_id": corr_id,
+            "duration_ms": duration_ms,
+            "ms_request_ids": ms_ids,
+        }
+        status_code = 200 if not error_cells else 207
+        return jsonify(response_payload), status_code
+
+    except GraphAPIError as ge:
+        status = ge.status_code if 400 <= (ge.status_code or 0) <= 599 else 502
+        payload = {
+            "error": ge.message,
+            "correlation_id": corr_id,
+        }
+        if ge.ms_request_id:
+            payload["ms_request_id"] = ge.ms_request_id
+        return jsonify(payload), status
+
+    except Exception as e:
+        return jsonify({"error": str(e), "correlation_id": corr_id}), 500
+
+
+
+@graph_bp.post("/excel/insert-rows")
+def insert_rows():
+    """
+    Inserta una o varias filas desplazando hacia abajo a partir de start_cell (A2 o Hoja!A2)
+    y escribe los valores provistos.
+    """
+    body = request.get_json() or {}
+    err = require_fields(body, ["client_key", "tenant_name", "dest_file_name", "start_cell"])
+    if err:
+        return jsonify({"error": err}), 400
+
+    err = validate_string_field("client_key", body.get("client_key"), max_length=MAX_CLIENT_FIELD_LENGTH)
+    if err:
+        return jsonify({"error": err}), 400
+
+    err = validate_string_field("tenant_name", body.get("tenant_name"), max_length=MAX_TENANT_NAME_LENGTH)
+    if err:
+        return jsonify({"error": err}), 400
+
+    err = validate_string_field("dest_file_name", body.get("dest_file_name"), max_length=MAX_DEST_FILE_NAME_LENGTH)
+    if err:
+        return jsonify({"error": err}), 400
+
+    start_cell = body.get("start_cell")
+    if not isinstance(start_cell, str) or not CELL_REF_RE.match(start_cell):
+        return jsonify({"error": "start_cell inválido; usa 'A2' o 'Hoja!A2'"}), 400
+
+    rows = body.get("rows")
+    row_count = body.get("row_count")
+    merge_ranges = body.get("merge_ranges")
+    max_cols = 0
+    if rows is None:
+        if row_count is None:
+            return jsonify({"error": "Debes enviar rows o row_count"}), 400
+        if not isinstance(row_count, int) or row_count <= 0:
+            return jsonify({"error": "row_count debe ser un entero > 0"}), 400
+    else:
+        if not isinstance(rows, list) or not rows:
+            return jsonify({"error": "rows debe ser una lista de filas (listas) no vacía"}), 400
+        for idx, row in enumerate(rows):
+            if not isinstance(row, list):
+                return jsonify({"error": f"rows[{idx}] debe ser una lista"}), 400
+            if not row:
+                return jsonify({"error": f"rows[{idx}] no puede estar vacío"}), 400
+            for val in row:
+                if not (isinstance(val, (str, int, float, bool)) or val is None):
+                    return jsonify({"error": f"Tipo no soportado en rows[{idx}]: {type(val).__name__}"}), 400
+            max_cols = max(max_cols, len(row))
+        if max_cols == 0:
+            return jsonify({"error": "rows debe contener al menos una columna"}), 400
+
+    dest_file_name = body["dest_file_name"].strip()
+    if any(sep in dest_file_name for sep in ("/", "\\")) or dest_file_name.startswith(".") or ".." in dest_file_name:
+        return jsonify({"error": "dest_file_name inválido"}), 400
+    if not dest_file_name.lower().endswith(".xlsx"):
+        return jsonify({"error": "dest_file_name debe terminar en .xlsx"}), 400
+    body["dest_file_name"] = dest_file_name
+
+    if merge_ranges is not None:
+        if not isinstance(merge_ranges, list) or not all(isinstance(r, str) for r in merge_ranges):
+            return jsonify({"error": "merge_ranges debe ser una lista de strings"}), 400
+
+    target_alias = body.get("target_alias")
+    if target_alias is not None:
+        err = validate_string_field("target_alias", target_alias, max_length=MAX_TARGET_ALIAS_LENGTH)
+        if err:
+            return jsonify({"error": err}), 400
+        alias_clean = target_alias.strip()
+        if alias_clean and not ALLOWED_IDENTIFIER_RE.match(alias_clean):
+            return jsonify({"error": "target_alias contiene caracteres no permitidos"}), 400
+        body["target_alias"] = alias_clean or None
+
+    loc_err, (normalized_type, ident_clean) = validate_location_selector(
+        body.get("location_type"), body.get("location_identifier")
+    )
+    if loc_err:
+        return jsonify({"error": loc_err}), 400
+    body["location_type"] = normalized_type
+    body["location_identifier"] = ident_clean
+
+    corr_id = new_correlation_id()
+    t0 = time.perf_counter()
+
+    db = request.environ.get("db_session")
+
+    try:
+        creds = (
+            db.query(TenantCredentials)
+            .filter_by(client_key=body["client_key"], enabled=True)
+            .first()
+        )
+        if not creds:
+            return jsonify({"error": "Configuración incompleta en DB"}), 400
+
+        storage_query = (
+            db.query(StorageTargets)
+            .filter_by(client_key=body["client_key"], tenant_id=creds.id)
+        )
+        target_alias = body.get("target_alias")
+        location_type = body.get("location_type")
+        location_identifier = body.get("location_identifier")
+        tenant_user = None
+        if target_alias:
+            tenant_user = (
+                db.query(TenantUsers)
+                .filter_by(tenant_id=creds.id, alias=target_alias)
+                .first()
+            )
+            if not tenant_user:
+                return jsonify({"error": f"target_alias '{target_alias}' no está configurado"}), 400
+            storage = storage_query.filter_by(tenant_user_id=tenant_user.id).first()
+            if not storage:
+                return jsonify({"error": f"No hay destino configurado para el alias '{target_alias}'"}), 400
+        else:
+            if location_type and location_identifier:
+                storage = (
+                    storage_query
+                    .filter_by(location_type=location_type, location_identifier=location_identifier)
+                    .first()
+                )
+                if not storage:
+                    return jsonify({"error": "No hay destino configurado para la ubicación indicada"}), 400
+            else:
+                storage = storage_query.first()
+
+        if not storage:
+            return jsonify({"error": "Configuración incompleta en DB"}), 400
+
+        auth = MicrosoftGraphAuthenticator(
+            creds.tenant_id, creds.app_client_id, creds.app_client_secret
+        )
+        token = auth.get_access_token()
+        gs = GraphServices(access_token=token, correlation_id=corr_id)
+
+        full_dest_path = _join_storage_path(
+            storage.default_dest_folder_path,
+            body["dest_file_name"],
+        )
+
+        drive_id, target_user_graph_id = _resolve_graph_target(storage)
+
+        insert_result, ms_ids = gs.insert_rows_graph(
+            full_dest_path=full_dest_path,
+            start_cell=start_cell,
+            rows=rows if rows is not None else None,
+            row_count=row_count if rows is None else None,
+            target_user_id=target_user_graph_id,
+            drive_id=drive_id,
+            merge_ranges=merge_ranges,
+        )
+
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        response_payload = {
+            **insert_result,
+            "correlation_id": corr_id,
+            "duration_ms": duration_ms,
+            "ms_request_ids": ms_ids,
+        }
         return jsonify(response_payload), 200
 
     except GraphAPIError as ge:
