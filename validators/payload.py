@@ -2,6 +2,7 @@ import re
 import uuid
 from datetime import datetime
 from string import Formatter
+from typing import Optional
 
 MAX_CLIENT_FIELD_LENGTH = 100
 MAX_TENANT_NAME_LENGTH = 100
@@ -15,6 +16,12 @@ MAX_NAMING_KEY_LENGTH = 64
 MAX_NAMING_VALUE_LENGTH = 512
 MAX_TARGET_ALIAS_LENGTH = 100
 MAX_LOCATION_IDENTIFIER_LENGTH = 200
+
+# Límites para modo secciones dinámicas
+MAX_SECTIONS = 50
+MAX_ROWS_PER_SECTION = 1000
+MAX_FIELDS_PER_ROW = 50
+
 ALLOWED_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 CELL_REF_RE = re.compile(r"^(?:([^!]+)!)?([A-Za-z]+[1-9][0-9]*)$")
 DRIVE_ID_PATTERN = re.compile(r"^[A-Za-z0-9!._-]{16,}$")
@@ -196,3 +203,76 @@ def validate_location_selector(location_type, location_identifier):
             return "location_identifier para user debe ser GUID o UPN", (None, None)
 
     return None, (normalized_type, ident_clean)
+
+
+def validate_section_data(sections: dict) -> Optional[str]:
+    """
+    Valida el payload de secciones dinámicas.
+    
+    Args:
+        sections: Dict con estructura:
+            {
+                "section_name": {...}  para key-value, o
+                "section_name": [{...}, {...}]  para tablas
+            }
+    
+    Returns:
+        None si válido, string con error si inválido
+    
+    Límites:
+        - Max 50 secciones
+        - Max 1000 filas por sección (si es tabla)
+        - Max 50 campos por fila
+        - Valores: string, int, float, bool, None
+        - Fórmulas: strings que empiezan con "="
+    """
+    if not isinstance(sections, dict):
+        return "sections debe ser un diccionario"
+    
+    if not sections:
+        return "sections no puede estar vacío"
+    
+    if len(sections) > MAX_SECTIONS:
+        return f"sections excede el máximo de {MAX_SECTIONS} secciones"
+    
+    for section_name, section_data in sections.items():
+        if not isinstance(section_name, str) or not section_name.strip():
+            return f"Nombre de sección inválido: '{section_name}'"
+        
+        # Puede ser dict (key-value) o list (tabla)
+        if isinstance(section_data, dict):
+            # Validar key-value simple
+            if len(section_data) > MAX_FIELDS_PER_ROW:
+                return f"Sección '{section_name}' excede {MAX_FIELDS_PER_ROW} campos"
+            
+            for field_name, value in section_data.items():
+                if not isinstance(field_name, str):
+                    return f"Sección '{section_name}': nombre de campo debe ser string"
+                
+                # Validar valor (permitir fórmulas con "=")
+                if not (isinstance(value, (str, int, float, bool)) or value is None):
+                    return f"Sección '{section_name}', campo '{field_name}': tipo no soportado ({type(value).__name__})"
+        
+        elif isinstance(section_data, list):
+            # Validar tabla (lista de filas)
+            if len(section_data) > MAX_ROWS_PER_SECTION:
+                return f"Sección '{section_name}' excede {MAX_ROWS_PER_SECTION} filas"
+            
+            for idx, row in enumerate(section_data):
+                if not isinstance(row, dict):
+                    return f"Sección '{section_name}', fila {idx}: debe ser un diccionario"
+                
+                if len(row) > MAX_FIELDS_PER_ROW:
+                    return f"Sección '{section_name}', fila {idx}: excede {MAX_FIELDS_PER_ROW} campos"
+                
+                for field_name, value in row.items():
+                    if not isinstance(field_name, str):
+                        return f"Sección '{section_name}', fila {idx}: nombre de campo debe ser string"
+                    
+                    if not (isinstance(value, (str, int, float, bool)) or value is None):
+                        return f"Sección '{section_name}', fila {idx}, campo '{field_name}': tipo no soportado"
+        
+        else:
+            return f"Sección '{section_name}': debe ser dict (key-value) o list (tabla)"
+    
+    return None

@@ -17,12 +17,24 @@ def _anchor_address_for(ws, addr: str) -> str:
             return f"{get_column_letter(mr.min_col)}{mr.min_row}"
     return addr
 
-def fill_cells_in_memory(template_bytes: bytes, data: Dict[str, Any]) -> BytesIO:
+def fill_cells_in_memory(template_bytes: bytes, data: Dict[str, Any], allow_formulas: bool = True) -> BytesIO:
     """
     Rellena celdas en un workbook a partir de un dict:
       - "A1": valor        → hoja ACTIVA del template
       - "Hoja1!B3": valor  → hoja 'Hoja1', celda B3
     Si la celda está combinada, escribe en la ancla del merge.
+    
+    Args:
+        template_bytes: Bytes del archivo Excel template
+        data: Dict con mapeo celda -> valor
+        allow_formulas: Si True, detecta strings con "=" como fórmulas (default: True)
+    
+    Returns:
+        BytesIO con el Excel procesado
+    
+    Note:
+        - Si allow_formulas=True y el valor es string que empieza con "=", se escribe como fórmula
+        - Ejemplo: {"A1": "=SUM(B1:B10)"} → escribe fórmula, no texto literal
     """
     wb = load_workbook(BytesIO(template_bytes))
     for key, value in data.items():
@@ -34,7 +46,12 @@ def fill_cells_in_memory(template_bytes: bytes, data: Dict[str, Any]) -> BytesIO
             addr = key
 
         target_addr = _anchor_address_for(ws, addr)
-        ws[target_addr].value = value
+        
+        # Detectar y escribir fórmulas si allow_formulas está habilitado
+        if allow_formulas and isinstance(value, str) and value.startswith("="):
+            ws[target_addr].value = value  # Openpyxl detecta "=" y lo trata como fórmula
+        else:
+            ws[target_addr].value = value
 
     out = BytesIO()
     wb.save(out)

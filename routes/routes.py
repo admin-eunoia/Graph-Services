@@ -14,6 +14,7 @@ from Postgress.Tables import (
 )
 from Auth.Microsoft_Graph_Auth import MicrosoftGraphAuthenticator
 from Services.graph_services import GraphServices, GraphAPIError
+from Services.excel_section_writer import fill_sections_in_memory
 from validators.payload import (
     ALLOWED_IDENTIFIER_RE,
     CELL_REF_RE,
@@ -29,6 +30,7 @@ from validators.payload import (
     validate_data_dict,
     validate_location_selector,
     validate_naming_dict,
+    validate_section_data,
     validate_string_field,
 )
 
@@ -71,34 +73,63 @@ def render_upload():
     """
     1) Lee tenant/template/target/tenantuser de DB
     2) Descarga template desde OneDrive del cliente
-    3) Rellena en memoria con 'data'
+    3) Rellena en memoria con 'data' (modo legacy) o 'sections' (modo dinámico)
     4) Sube el archivo final al destino (conflictBehavior del template)
     5) Inserta log en render_logs
 
+    MODO LEGACY (referencias estáticas):
     curl -X POST http://localhost:8000/graph/excel/render-upload 
         -H "Content-Type: application/json" 
-        -H "X-Api-Key: opcional-si-quieres-saltar-rate-limit" 
         -d '{
             "client_key": "eunoia",
             "template_key": "waman_prueba",
             "tenant_name": "Eunoia",
             "data": {
-            "A1": "Contoso",
-            "Hoja1!B3": 42,
-            "Hoja1!C5": "Ingreso"
+                "A1": "Contoso",
+                "Hoja1!B3": 42,
+                "Hoja1!C5": "=SUM(A1:A10)"
+            }
+        }'
+
+    MODO SECCIONES (dinámico con marcadores):
+    curl -X POST http://localhost:8000/graph/excel/render-upload 
+        -H "Content-Type: application/json" 
+        -d '{
+            "client_key": "eunoia",
+            "template_key": "invoice_template",
+            "tenant_name": "Eunoia",
+            "sections": {
+                "header": {
+                    "nombre": "ACME S.A.",
+                    "rfc": "ACM123456",
+                    "fecha": "2025-11-22"
+                },
+                "items": [
+                    {"concepto": "Servicio A", "monto": 1000, "iva": "=B5*0.16"},
+                    {"concepto": "Servicio B", "monto": 1500, "iva": "=B6*0.16"}
+                ],
+                "footer": {
+                    "subtotal": 2500,
+                    "total": "=B10+SUM(C5:C6)"
+                }
             },
-            "naming": {                                       opcional
-            "periodo": "2024-05",
-            "sucursal": "mexico"
-            },
-            "target_alias": "finance",                        opcional
-            "location_type": "drive",                         opcional
-            "location_identifier": "b!oZ1234567890abcdef",    opcional
-            "requested_by": "api-client-123"                  opcional
-    }'
+            "naming": {"periodo": "2024-05"},
+            "target_alias": "finance",
+            "requested_by": "api-client-123"
+        }'
     """
     body = request.get_json() or {}
-    err = require_fields(body, ["client_key", "template_key", "data", "tenant_name"])
+    
+    # Detectar si usa modo secciones o modo legacy
+    uses_sections = "sections" in body
+    
+    if uses_sections:
+        # Modo secciones dinámicas
+        err = require_fields(body, ["client_key", "template_key", "sections", "tenant_name"])
+    else:
+        # Modo legacy (referencias estáticas)
+        err = require_fields(body, ["client_key", "template_key", "data", "tenant_name"])
+    
     if err:
         return jsonify({"error": err}), 400
 
@@ -114,14 +145,21 @@ def render_upload():
     if err:
         return jsonify({"error": err}), 400
 
-    err = validate_data_dict(body.get("data"))
-    if err:
-        return jsonify({"error": err}), 400
+    # Validar según el modo
+    if uses_sections:
+        err = validate_section_data(body.get("sections"))
+        if err:
+            return jsonify({"error": err}), 400
+    else:
+        # Modo legacy
+        err = validate_data_dict(body.get("data"))
+        if err:
+            return jsonify({"error": err}), 400
 
-    try:
-        validate_cell_map_or_raise(body["data"])
-    except ValueError as ve:
-        return jsonify({"error": str(ve)}), 400
+        try:
+            validate_cell_map_or_raise(body["data"])
+        except ValueError as ve:
+            return jsonify({"error": str(ve)}), 400
 
     naming_provided = body.get("naming") not in (None, {})
     naming_err, sanitized_naming = validate_naming_dict(body.get("naming"))
@@ -222,8 +260,24 @@ def render_upload():
             drive_id=drive_id,
         )
 
-        # 4) Render en memoria
-        filled_bytes = gs.render_in_memory(tpl_bytes, body["data"])
+        # 4) Render en memoria (modo secciones o legacy)
+        if uses_sections:
+            # Modo secciones dinámicas
+            section_configs = template.cell_mapping.get("sections", {}) if template.cell_mapping else {}
+            
+            if not section_configs:
+                return jsonify({
+                    "error": f"Template '{template.template_key}' no tiene secciones configuradas en cell_mapping"
+                }), 400
+            
+            try:
+                filled_out = fill_sections_in_memory(tpl_bytes, body["sections"], section_configs)
+                filled_bytes = filled_out.getvalue()
+            except ValueError as ve:
+                return jsonify({"error": f"Error al procesar secciones: {str(ve)}"}), 400
+        else:
+            # Modo legacy (referencias estáticas)
+            filled_bytes = gs.render_in_memory(tpl_bytes, body["data"])
 
         # 5) Calcular nombre de archivo final según patrón configurable
         try:
@@ -243,11 +297,14 @@ def render_upload():
         # 6) Guardar log
         duration_ms = int((time.perf_counter() - t0) * 1000)
         
+        # Guardar data_json según el modo usado
+        data_for_log = body.get("sections") if uses_sections else body.get("data")
+        
         log_row = RenderLogs(
             client_key=body["client_key"],
             template_id=template.id,
             template_key=template.template_key,
-            data_json=body["data"],
+            data_json=data_for_log,
             result_drive_item_id=upload_result.get("id"),
             result_web_url=upload_result.get("webUrl"),
             status=RenderStatus.SUCCESS,
@@ -1063,6 +1120,171 @@ def insert_rows():
             "ms_request_ids": ms_ids,
         }
         return jsonify(response_payload), 200
+
+    except GraphAPIError as ge:
+        status = ge.status_code if 400 <= (ge.status_code or 0) <= 599 else 502
+        payload = {
+            "error": ge.message,
+            "correlation_id": corr_id,
+        }
+        if ge.ms_request_id:
+            payload["ms_request_id"] = ge.ms_request_id
+        return jsonify(payload), status
+
+    except Exception as e:
+        return jsonify({"error": str(e), "correlation_id": corr_id}), 500
+
+@graph_bp.post("/excel/find-markers")
+def find_markers():
+    """
+    Endpoint de utilidad para descubrir marcadores en un template Excel.
+    Retorna lista de textos que parecen ser marcadores (terminan en ':' o contienen palabras clave).
+    
+    Útil para configurar cell_mapping.sections sin abrir el Excel manualmente.
+    
+    curl -X POST http://localhost:8000/graph/excel/find-markers 
+        -H "Content-Type: application/json" 
+        -d '{
+            "client_key": "eunoia",
+            "template_key": "invoice_template",
+            "tenant_name": "Eunoia"
+        }'
+    """
+    body = request.get_json() or {}
+    err = require_fields(body, ["client_key", "template_key", "tenant_name"])
+    if err:
+        return jsonify({"error": err}), 400
+
+    err = validate_string_field("client_key", body.get("client_key"), max_length=MAX_CLIENT_FIELD_LENGTH)
+    if err:
+        return jsonify({"error": err}), 400
+
+    err = validate_string_field("template_key", body.get("template_key"), max_length=MAX_TEMPLATE_KEY_LENGTH)
+    if err:
+        return jsonify({"error": err}), 400
+
+    err = validate_string_field("tenant_name", body.get("tenant_name"), max_length=MAX_TENANT_NAME_LENGTH)
+    if err:
+        return jsonify({"error": err}), 400
+
+    target_alias = body.get("target_alias")
+    if target_alias is not None:
+        err = validate_string_field("target_alias", target_alias, max_length=MAX_TARGET_ALIAS_LENGTH)
+        if err:
+            return jsonify({"error": err}), 400
+
+    loc_err, (normalized_type, ident_clean) = validate_location_selector(
+        body.get("location_type"), body.get("location_identifier")
+    )
+    if loc_err:
+        return jsonify({"error": loc_err}), 400
+
+    corr_id = new_correlation_id()
+    db = request.environ.get("db_session")
+
+    try:
+        creds = (
+            db.query(TenantCredentials)
+            .filter_by(client_key=body["client_key"], enabled=True)
+            .first()
+        )
+        if not creds:
+            return jsonify({"error": "Configuración incompleta en DB"}), 400
+
+        template = (
+            db.query(Templates)
+            .filter_by(client_key=body["client_key"], template_key=body["template_key"])
+            .first()
+        )
+        if not template:
+            return jsonify({"error": "Template no encontrado"}), 400
+
+        storage_query = (
+            db.query(StorageTargets)
+            .filter_by(client_key=body["client_key"], tenant_id=creds.id)
+        )
+        
+        if target_alias:
+            tenant_user = (
+                db.query(TenantUsers)
+                .filter_by(tenant_id=creds.id, alias=target_alias)
+                .first()
+            )
+            if not tenant_user:
+                return jsonify({"error": f"target_alias '{target_alias}' no configurado"}), 400
+            storage = storage_query.filter_by(tenant_user_id=tenant_user.id).first()
+        elif normalized_type and ident_clean:
+            storage = (
+                storage_query
+                .filter_by(location_type=normalized_type, location_identifier=ident_clean)
+                .first()
+            )
+        else:
+            storage = storage_query.first()
+
+        if not storage:
+            return jsonify({"error": "No hay destino de almacenamiento configurado"}), 400
+
+        auth = MicrosoftGraphAuthenticator(
+            creds.tenant_id, creds.app_client_id, creds.app_client_secret
+        )
+        token = auth.get_access_token()
+        gs = GraphServices(access_token=token, correlation_id=corr_id)
+
+        full_template_path = _join_storage_path(
+            template.template_folder_path,
+            template.template_file_name,
+        )
+        drive_id, target_user_graph_id = _resolve_graph_target(storage)
+
+        tpl_bytes, _ = gs.download_file_bytes(
+            full_template_path,
+            target_user_id=target_user_graph_id,
+            drive_id=drive_id,
+        )
+
+        from openpyxl import load_workbook
+        from openpyxl.utils import get_column_letter
+        from io import BytesIO
+
+        wb = load_workbook(BytesIO(tpl_bytes))
+        markers = []
+
+        for sheet in wb.worksheets:
+            for row in sheet.iter_rows():
+                for cell in row:
+                    if cell.value and isinstance(cell.value, str):
+                        text = str(cell.value).strip()
+                        is_marker = False
+                        
+                        if text.endswith(':'):
+                            is_marker = True
+                        elif any(keyword in text.upper() for keyword in [
+                            'DATOS', 'DETALLE', 'TOTAL', 'RESUMEN', 'CLIENTE',
+                            'PAGOS', 'ITEMS', 'PRODUCTOS', 'SERVICIOS', 'FOOTER',
+                            'HEADER', 'INFORMACIÓN'
+                        ]):
+                            is_marker = True
+                        elif text.isupper() and len(text) > 3:
+                            is_marker = True
+                        
+                        if is_marker:
+                            col_letter = get_column_letter(cell.column)
+                            markers.append({
+                                "text": text,
+                                "position": f"{col_letter}{cell.row}",
+                                "sheet": sheet.title,
+                                "row": cell.row,
+                                "column": cell.column
+                            })
+
+        return jsonify({
+            "message": "OK",
+            "template_key": template.template_key,
+            "markers_found": len(markers),
+            "markers": markers,
+            "correlation_id": corr_id
+        }), 200
 
     except GraphAPIError as ge:
         status = ge.status_code if 400 <= (ge.status_code or 0) <= 599 else 502

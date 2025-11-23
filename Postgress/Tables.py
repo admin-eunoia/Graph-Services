@@ -84,6 +84,61 @@ class Templates(Base):
     dest_file_pattern = Column(String(255), nullable=False)
     default_conflict_behavior = Column(String(10), default="fail")
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    
+    # cell_mapping: Configuración de secciones dinámicas para escritura basada en marcadores
+    # Schema esperado:
+    # {
+    #   "sections": {
+    #     "header": {
+    #       "marker": "DATOS DEL CLIENTE:",          // Texto a buscar en el Excel
+    #       "sheet": "Hoja1",                        // Nombre de la hoja (opcional, default: hoja activa)
+    #       "start_row_offset": 1,                   // Filas después del marcador donde escribir
+    #       "start_col_offset": 0,                   // Columnas después del marcador
+    #       "is_table": false,                       // false = key-value, true = tabla de filas
+    #       "columns": {                             // Mapeo de campos a offset de columnas
+    #         "nombre": 0,                           // Columna relativa al marcador
+    #         "rfc": 1,
+    #         "direccion": 2
+    #       }
+    #     },
+    #     "items": {
+    #       "marker": "DETALLE DE PAGOS:",
+    #       "sheet": "Hoja1",
+    #       "start_row_offset": 2,                   // Filas después del marcador (para headers)
+    #       "start_col_offset": 0,
+    #       "is_table": true,                        // Permite múltiples filas de datos
+    #       "columns": {
+    #         "fecha": 0,
+    #         "concepto": 1,
+    #         "monto": 2,
+    #         "estado": 3
+    #       },
+    #       "merge_ranges": [                        // Opcional: rangos a re-aplicar por fila
+    #         "A{row}:B{row}",                       // {row} se reemplaza con número de fila
+    #         "C{row}:D{row}"
+    #       ]
+    #     },
+    #     "footer": {
+    #       "marker": "TOTALES:",
+    #       "start_row_offset": 1,
+    #       "is_table": false,
+    #       "columns": {
+    #         "subtotal": 1,
+    #         "iva": 2,
+    #         "total": 3
+    #       }
+    #     }
+    #   }
+    # }
+    #
+    # Notas:
+    # - Si cell_mapping es null o no contiene "sections", el sistema usa modo legacy (referencias estáticas)
+    # - Los valores pueden ser strings, números, booleanos, null, o fórmulas (strings con "=")
+    # - Las fórmulas se detectan automáticamente si empiezan con "="
+    # - start_row_offset: 0 = misma fila del marcador, 1 = siguiente, etc.
+    # - start_col_offset: 0 = misma columna del marcador, 1 = siguiente, etc.
+    # - is_table=true permite insertar filas dinámicamente si hay más datos que filas en template
+    # - merge_ranges: patron con {row} para re-aplicar merges en cada fila insertada
     cell_mapping = Column(JSON, nullable=True)
     
 
