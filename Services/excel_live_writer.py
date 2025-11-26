@@ -1,698 +1,799 @@
 # excel_live_writer.py
 """
-Sistema de escritura en Excel EN VIVO usando Microsoft Graph API.
-Permite editar archivos Excel sin descargarlos, incluso si están abiertos.
-
-Funciones principales:
-1. buscar_marcador_live() - Busca un marcador en el Excel
-2. llenar_seccion_live() - Llena una sección en vivo
-3. llenar_tabla_live() - Llena una tabla en vivo
-4. insertar_filas_live() - Inserta filas en una posición específica
-5. obtener_merges_fila() - Obtiene los merges de una fila
-6. aplicar_merges_filas() - Aplica merges a múltiples filas
+Escritura en Excel EN VIVO usando Microsoft Graph API.
+Lee toda la configuración desde la base de datos automáticamente.
 """
 from typing import Dict, Any, List, Optional, Tuple
 from Services.graph_services import GraphServices, _col_index_to_letters
+from sqlalchemy.orm import Session
+from Postgress.connection import SessionLocal
+from Postgress.Tables import (
+    TenantCredentials,
+    StorageTargets,
+    Templates,
+    ExcelFiles,
+    ExcelSections,
+    ExcelFields,
+    OperationLogs,
+    OperationType,
+    RenderStatus
+)
+from Auth.Microsoft_Graph_Auth import MicrosoftGraphAuthenticator
+from datetime import datetime
+import uuid
 
 
-def buscar_marcador_live(
-    client: GraphServices,
-    file_path: str,
-    marker: str,
-    target_user_id: str = None,
-    drive_id: str = None,
-    sheet_name: str = None
-) -> Tuple[Optional[int], Optional[int]]:
-    """
-    Busca un marcador en el Excel usando la API.
+class ExcelLiveWriter:
+    """Wrapper para operaciones de Excel usando Graph API con configuración desde DB."""
     
-    Args:
-        client: Cliente de GraphServices
-        file_path: Ruta del archivo en OneDrive
-        marker: Texto a buscar
-        target_user_id: Email del usuario
-        drive_id: ID del drive (opcional)
-        sheet_name: Nombre de la hoja (None = primera hoja)
+    def __init__(self, client_key: str, correlation_id: str = None):
+        """
+        Inicializa el writer.
+        
+        Args:
+            client_key: Clave del cliente en tenant_credentials
+            correlation_id: ID opcional para tracking
+        """
+        self.client_key = client_key
+        self.correlation_id = correlation_id
+        self.db = SessionLocal()
+        self.client = self._init_graph_client()
     
-    Returns:
-        (fila, columna) donde se encontró el marcador, o (None, None)
-    """
-    # Resolver item_id
-    item_id, _ = client._resolve_item_id(
-        file_path,
-        target_user_id=target_user_id,
-        drive_id=drive_id
-    )
-    
-    # Obtener hojas
-    sheets, _ = client._resolve_worksheets(
-        item_id=item_id,
-        target_user_id=target_user_id,
-        drive_id=drive_id
-    )
-    
-    if not sheets:
-        raise ValueError("No se encontraron hojas en el Excel")
-    
-    # Seleccionar hoja
-    if sheet_name:
-        sheet = next((s for s in sheets if s.get("name") == sheet_name), None)
-        if not sheet:
-            raise ValueError(f"Hoja '{sheet_name}' no encontrada")
-    else:
-        sheet = sheets[0]
-    
-    ws_id = sheet["id"]
-    
-    # Obtener rango usado
-    if drive_id:
-        base = f"{client.graph_url}/drives/{drive_id}/items/{item_id}"
-    else:
-        base = f"{client.graph_url}/users/{target_user_id}/drive/items/{item_id}"
-    
-    url = f"{base}/workbook/worksheets/{ws_id}/usedRange"
-    resp, _ = client._request_with_retry("GET", url, expected=(200,), headers=client._headers())
-    
-    data = resp.json()
-    values = data.get("values", [])
-    row_offset = data.get("rowIndex", 0)
-    col_offset = data.get("columnIndex", 0)
-    
-    # Buscar el marcador
-    for row_idx, row in enumerate(values):
-        for col_idx, cell_value in enumerate(row):
-            if cell_value and marker in str(cell_value):
-                fila = row_offset + row_idx + 1  # 1-indexed
-                columna = col_offset + col_idx + 1  # 1-indexed
-                print(f"   ✓ Marcador '{marker}' encontrado en fila {fila}, columna {columna}")
-                return (fila, columna)
-    
-    return (None, None)
-
-
-def llenar_seccion_live(
-    client: GraphServices,
-    file_path: str,
-    marker: str,
-    datos: Dict[str, Any],
-    columnas: Dict[str, int],
-    target_user_id: str = None,
-    drive_id: str = None,
-    sheet_name: str = None
-):
-    """
-    Llena una sección simple (key-value) EN VIVO.
-    
-    Args:
-        client: Cliente de GraphServices
-        file_path: Ruta del archivo en OneDrive
-        marker: Marcador a buscar
-        datos: Diccionario con los datos {campo: valor}
-        columnas: Mapeo de campo -> offset de columna {campo: 0, otro: 1}
-        target_user_id: Email del usuario
-        drive_id: ID del drive
-        sheet_name: Nombre de la hoja
-    
-    Ejemplo:
-        llenar_seccion_live(
-            client, "ruta/archivo.xlsx", "DATOS DEL CLIENTE",
-            datos={"nombre": "ACME", "rfc": "ACM123"},
-            columnas={"nombre": 0, "rfc": 1},
-            target_user_id="user@domain.com"
+    def _init_graph_client(self) -> GraphServices:
+        """Inicializa el cliente de Graph API."""
+        creds = self.db.query(TenantCredentials).filter_by(
+            client_key=self.client_key,
+            enabled=True
+        ).first()
+        
+        if not creds:
+            raise ValueError(f"Cliente '{self.client_key}' no encontrado")
+        
+        auth = MicrosoftGraphAuthenticator(
+            creds.tenant_id,
+            creds.app_client_id,
+            creds.app_client_secret
         )
-    """
-    # Buscar marcador
-    marker_row, marker_col = buscar_marcador_live(
-        client, file_path, marker, target_user_id, drive_id, sheet_name
-    )
+        token = auth.get_access_token()
+        return GraphServices(access_token=token, correlation_id=self.correlation_id)
     
-    if not marker_row:
-        raise ValueError(f"No se encontró '{marker}' en el Excel")
+    def close(self):
+        """Cierra la sesión de base de datos."""
+        if self.db:
+            self.db.close()
     
-    # Resolver item_id y worksheet
-    item_id, _ = client._resolve_item_id(file_path, target_user_id=target_user_id, drive_id=drive_id)
-    sheets, _ = client._resolve_worksheets(item_id=item_id, target_user_id=target_user_id, drive_id=drive_id)
+    def __enter__(self):
+        return self
     
-    if sheet_name:
-        sheet = next((s for s in sheets if s.get("name") == sheet_name), None)
-    else:
-        sheet = sheets[0]
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
     
-    ws_id = sheet["id"]
-    ws_name = sheet["name"]
-    
-    # Fila destino (siguiente al marcador)
-    fila_destino = marker_row + 1
-    
-    # Construir URL base
-    if drive_id:
-        base = f"{client.graph_url}/drives/{drive_id}/items/{item_id}"
-    else:
-        base = f"{client.graph_url}/users/{target_user_id}/drive/items/{item_id}"
-    
-    # Escribir cada campo
-    print(f"   ✏️  Escribiendo {len(datos)} campos en fila {fila_destino}...")
-    for campo, valor in datos.items():
-        if campo not in columnas:
-            continue
+    def _get_file_context(self, file_key: str = None, section_key: str = None):
+        """
+        Obtiene contexto completo desde DB.
         
-        col_offset = columnas[campo]
-        col_destino = marker_col + col_offset
-        col_letter = _col_index_to_letters(col_destino)
+        Returns:
+            (excel_file, section, fields, storage, file_path, drive_id, target_user_id)
+        """
+        excel_file = self._get_file(file_key)
         
-        # Dirección de la celda
-        cell_address = f"{ws_name}!{col_letter}{fila_destino}"
-        
-        # PATCH a la celda
-        url = f"{base}/workbook/worksheets/{ws_id}/range(address='{cell_address}')"
-        
-        try:
-            client._request_with_retry(
-                "PATCH",
-                url,
-                expected=(200,),
-                headers=client._headers(),
-                json={"values": [[valor]]}
-            )
-            print(f"      ✓ {campo}: {valor}")
-        except Exception as e:
-            print(f"      ✗ {campo}: Error - {e}")
-
-
-def llenar_tabla_live(
-    client: GraphServices,
-    file_path: str,
-    marker: str,
-    datos: List[Dict[str, Any]],
-    columnas: Dict[str, int],
-    target_user_id: str = None,
-    drive_id: str = None,
-    sheet_name: str = None,
-    merges_a_aplicar: Optional[List[str]] = None
-):
-    """
-    Llena una tabla (múltiples filas) EN VIVO.
-    
-    Args:
-        client: Cliente de GraphServices
-        file_path: Ruta del archivo en OneDrive
-        marker: Marcador a buscar
-        datos: Lista de diccionarios con los datos
-        columnas: Mapeo de campo -> offset de columna
-        target_user_id: Email del usuario
-        drive_id: ID del drive
-        sheet_name: Nombre de la hoja
-        merges_a_aplicar: Lista de rangos a mergear en cada fila
-                         Ejemplo: ["A:C"] mergeará columnas A-C en cada fila
-    
-    Ejemplo:
-        llenar_tabla_live(
-            client, "ruta/archivo.xlsx", "SEGUIMIENTO",
-            datos=[
-                {"fecha": "2025-01", "medio": "Email", "comentarios": "Contacto"},
-                {"fecha": "2025-02", "medio": "Teléfono", "comentarios": "Llamada"}
-            ],
-            columnas={"fecha": 0, "medio": 1, "comentarios": 2},
-            target_user_id="user@domain.com",
-            merges_a_aplicar=["A:C"]  # Opcional: mergear columnas
-        )
-    """
-    # Buscar marcador
-    marker_row, marker_col = buscar_marcador_live(
-        client, file_path, marker, target_user_id, drive_id, sheet_name
-    )
-    
-    if not marker_row:
-        raise ValueError(f"No se encontró '{marker}' en el Excel")
-    
-    # Resolver item_id y worksheet
-    item_id, _ = client._resolve_item_id(file_path, target_user_id=target_user_id, drive_id=drive_id)
-    sheets, _ = client._resolve_worksheets(item_id=item_id, target_user_id=target_user_id, drive_id=drive_id)
-    
-    if sheet_name:
-        sheet = next((s for s in sheets if s.get("name") == sheet_name), None)
-    else:
-        sheet = sheets[0]
-    
-    ws_id = sheet["id"]
-    ws_name = sheet["name"]
-    
-    # Fila de inicio (marcador + 1 header + 1)
-    fila_inicio = marker_row + 2
-    
-    # Construir URL base
-    if drive_id:
-        base = f"{client.graph_url}/drives/{drive_id}/items/{item_id}"
-    else:
-        base = f"{client.graph_url}/users/{target_user_id}/drive/items/{item_id}"
-    
-    # Preparar datos en formato de matriz
-    num_filas = len(datos)
-    num_columnas = len(columnas)
-    
-    # Crear matriz vacía
-    matriz = [[None] * num_columnas for _ in range(num_filas)]
-    
-    # Llenar matriz
-    for row_idx, fila_datos in enumerate(datos):
-        for campo, valor in fila_datos.items():
-            if campo in columnas:
-                col_offset = columnas[campo]
-                matriz[row_idx][col_offset] = valor
-    
-    # Calcular rango
-    col_inicio_letter = _col_index_to_letters(marker_col)
-    col_fin_letter = _col_index_to_letters(marker_col + num_columnas - 1)
-    fila_fin = fila_inicio + num_filas - 1
-    
-    range_address = f"{ws_name}!{col_inicio_letter}{fila_inicio}:{col_fin_letter}{fila_fin}"
-    
-    # PATCH al rango completo
-    url = f"{base}/workbook/worksheets/{ws_id}/range(address='{range_address}')"
-    
-    print(f"   ✏️  Escribiendo {num_filas} filas en rango {range_address}...")
-    
-    try:
-        client._request_with_retry(
-            "PATCH",
-            url,
-            expected=(200,),
-            headers=client._headers(),
-            json={"values": matriz}
-        )
-        print(f"      ✓ {num_filas} filas escritas exitosamente")
-    except Exception as e:
-        print(f"      ✗ Error: {e}")
-    
-    # Aplicar merges si se especificaron
-    if merges_a_aplicar and len(merges_a_aplicar) > 0:
-        try:
-            print(f"      💡 Aplicando merges a {num_filas} filas...")
+        section = None
+        fields = None
+        if section_key:
+            section = self.db.query(ExcelSections).filter_by(
+                client_key=self.client_key,
+                template_id=excel_file.template_id,
+                section_key=section_key,
+                is_active=True
+            ).first()
             
-            for i in range(num_filas):
-                fila_actual = fila_inicio + i
-                
-                for merge_range in merges_a_aplicar:
-                    if ":" in merge_range:
-                        col_inicio_merge, col_fin_merge = merge_range.split(":")
-                        # Ajustar al offset del marcador
-                        col_inicio_abs = col_inicio_merge
-                        col_fin_abs = col_fin_merge
-                        rango_merge = f"{col_inicio_abs}{fila_actual}:{col_fin_abs}{fila_actual}"
-                    else:
-                        continue
-                    
-                    merge_url = f"{base}/workbook/worksheets/{ws_id}/range(address='{rango_merge}')/merge"
-                    try:
-                        client._request_with_retry(
-                            "POST",
-                            merge_url,
-                            expected=(200, 204),
-                            headers=client._headers(),
-                            json={"across": True}
-                        )
-                    except Exception as e_merge:
-                        print(f"      ⚠️  No se pudo mergear {rango_merge}: {e_merge}")
+            if not section:
+                raise ValueError(f"Sección '{section_key}' no encontrada")
             
-            print(f"      ✓ Merges aplicados")
-        except Exception as e_merges:
-            print(f"      ⚠️  Error aplicando merges: {e_merges}")
-
-
-def procesar_excel_live(
-    client: GraphServices,
-    file_path: str,
-    secciones: Dict[str, Any],
-    configuracion: Dict[str, Dict],
-    target_user_id: str = None,
-    drive_id: str = None
-):
-    """
-    Función todo-en-uno para procesar múltiples secciones EN VIVO.
-    
-    Args:
-        client: Cliente de GraphServices
-        file_path: Ruta del archivo en OneDrive
-        secciones: Datos por sección {"nombre_seccion": datos}
-        configuracion: Config de cada sección
-        target_user_id: Email del usuario
-        drive_id: ID del drive
-    
-    Ejemplo:
-        procesar_excel_live(
-            client,
-            "ruta/archivo.xlsx",
-            secciones={
-                "cliente": {"nombre": "ACME", "rfc": "ACM123"},
-                "pagos": [{"fecha": "2025-01", "monto": 1000}]
-            },
-            configuracion={
-                "cliente": {
-                    "marker": "DATOS DEL CLIENTE",
-                    "es_tabla": False,
-                    "columnas": {"nombre": 0, "rfc": 1}
-                },
-                "pagos": {
-                    "marker": "Pagos",
-                    "es_tabla": True,
-                    "columnas": {"fecha": 0, "monto": 1}
-                }
-            },
-            target_user_id="user@domain.com"
-        )
-    """
-    print("🔥 Procesando Excel EN VIVO...")
-    
-    for nombre_seccion, datos in secciones.items():
-        if nombre_seccion not in configuracion:
-            continue
+            fields = self.db.query(ExcelFields).filter_by(
+                section_id=section.id,
+                is_active=True
+            ).all()
         
-        config = configuracion[nombre_seccion]
-        marker = config["marker"]
-        es_tabla = config.get("es_tabla", False)
-        columnas = config.get("columnas", {})
-        sheet_name = config.get("sheet_name")
+        storage = self.db.query(StorageTargets).filter_by(
+            id=excel_file.storage_target_id
+        ).first()
         
-        print(f"\n📝 Sección: {nombre_seccion}")
+        if not storage:
+            raise ValueError("Storage no encontrado")
         
-        if es_tabla:
-            llenar_tabla_live(
-                client, file_path, marker, datos, columnas,
-                target_user_id, drive_id, sheet_name
-            )
+        file_path = f"{excel_file.file_folder_path}/{excel_file.file_name}".replace("//", "/")
+        
+        drive_id = None
+        target_user_id = None
+        if storage.location_type.value.upper() == "DRIVE":
+            drive_id = storage.location_identifier
         else:
-            llenar_seccion_live(
-                client, file_path, marker, datos, columnas,
-                target_user_id, drive_id, sheet_name
-            )
-    
-    print("\n✅ Proceso completado")
-
-
-def obtener_merges_fila(
-    client: GraphServices,
-    item_id: str,
-    ws_id: str,
-    fila: int,
-    target_user_id: str = None,
-    drive_id: str = None
-) -> List[Dict[str, Any]]:
-    """
-    Obtiene los rangos merged de una fila específica.
-    
-    Args:
-        client: Cliente de GraphServices
-        item_id: ID del archivo
-        ws_id: ID de la hoja
-        fila: Número de fila (1-indexed)
-        target_user_id: Email del usuario
-        drive_id: ID del drive
-    
-    Returns:
-        Lista de rangos merged que incluyen esa fila
-        Ejemplo: [{"address": "A22:C22"}, {"address": "D22:F22"}]
-    """
-    if drive_id:
-        base = f"{client.graph_url}/drives/{drive_id}/items/{item_id}"
-    else:
-        base = f"{client.graph_url}/users/{target_user_id}/drive/items/{item_id}"
-    
-    # Obtener el rango usado de la hoja
-    url = f"{base}/workbook/worksheets/{ws_id}/usedRange"
-    resp, _ = client._request_with_retry("GET", url, expected=(200,), headers=client._headers())
-    data = resp.json()
-    
-    # Obtener merged cells de la hoja
-    # Microsoft Graph no tiene endpoint directo, así que usamos range/format
-    # Obtenemos el formato del rango de la fila
-    col_start = data.get("columnIndex", 0) + 1
-    col_end = data.get("columnIndex", 0) + data.get("columnCount", 10)
-    
-    col_start_letter = _col_index_to_letters(col_start)
-    col_end_letter = _col_index_to_letters(col_end)
-    
-    range_address = f"{col_start_letter}{fila}:{col_end_letter}{fila}"
-    
-    url = f"{base}/workbook/worksheets/{ws_id}/range(address='{range_address}')"
-    resp, _ = client._request_with_retry("GET", url, expected=(200,), headers=client._headers())
-    data = resp.json()
-    
-    merges = []
-    cell_count = data.get("cellCount", 0)
-    row_count = data.get("rowCount", 1)
-    col_count = data.get("columnCount", 0)
-    
-    # Si el rango tiene merges, los extraemos manualmente
-    # Verificando el número de celdas vs el tamaño esperado
-    if "address" in data:
-        # Para detectar merges, necesitamos verificar cada celda
-        # Usamos la propiedad mergedAreas si está disponible
-        address = data.get("address", "")
-        if "!" in address:
-            address = address.split("!")[-1]
+            target_user_id = storage.location_identifier
         
-        # Por ahora, retornamos info básica
-        # En una implementación más completa, iteraríamos celda por celda
-        merges.append({"address": address, "row": fila})
+        return excel_file, section, fields, storage, file_path, drive_id, target_user_id
     
-    return merges
-
-
-def aplicar_merges_filas(
-    client: GraphServices,
-    item_id: str,
-    ws_id: str,
-    ws_name: str,
-    fila_template: int,
-    filas_destino: List[int],
-    target_user_id: str = None,
-    drive_id: str = None
-):
-    """
-    Aplica los merges de una fila template a múltiples filas destino.
-    
-    Args:
-        client: Cliente de GraphServices
-        item_id: ID del archivo
-        ws_id: ID de la hoja
-        ws_name: Nombre de la hoja
-        fila_template: Fila de la cual copiar el formato de merge
-        filas_destino: Lista de filas donde aplicar los merges
-        target_user_id: Email del usuario
-        drive_id: ID del drive
-    """
-    if drive_id:
-        base = f"{client.graph_url}/drives/{drive_id}/items/{item_id}"
-    else:
-        base = f"{client.graph_url}/users/{target_user_id}/drive/items/{item_id}"
-    
-    # Obtener el rango de la fila template para analizar sus merges
-    url = f"{base}/workbook/worksheets/{ws_id}/range(address='{fila_template}:{fila_template}')"
-    resp, _ = client._request_with_retry("GET", url, expected=(200,), headers=client._headers())
-    template_data = resp.json()
-    
-    # Obtener el formato completo incluyendo merges
-    format_url = f"{base}/workbook/worksheets/{ws_id}/range(address='{fila_template}:{fila_template}')/format"
-    resp_format, _ = client._request_with_retry("GET", format_url, expected=(200,), headers=client._headers())
-    format_data = resp_format.json()
-    
-    # Detectar rangos merged analizando el formato de celdas
-    # Microsoft Graph API tiene limitaciones aquí, usaremos merge directo por rango
-    # Aplicar merge a las filas destino con el mismo patrón
-    
-    for fila_dest in filas_destino:
-        # Intentar copiar el formato completo de la fila template
-        try:
-            # Merge específico: necesitamos saber qué columnas están merged
-            # Por ahora, aplicaremos merge basado en el patrón más común
-            # que vemos en la imagen: A-C merged
-            
-            # Opción simple: merge las mismas columnas que en template
-            col_start_letter = template_data.get("address", "A1").split("!")[0] if "!" in template_data.get("address", "") else "A"
-            
-            # Para cada rango merged detectado, aplicarlo a la fila destino
-            # Esto es una aproximación - idealmente necesitaríamos la API de MergedAreas
-            pass
-            
-        except Exception as e:
-            print(f"      ⚠️  Error copiando formato de fila {fila_template} a {fila_dest}: {e}")
-
-
-def insertar_filas_live(
-    client: GraphServices,
-    file_path: str,
-    fila_inicio: int,
-    datos: List[Dict[str, Any]],
-    columnas: Dict[str, int],
-    target_user_id: str = None,
-    drive_id: str = None,
-    sheet_name: str = None,
-    columna_inicio: int = 1,
-    merges_a_aplicar: Optional[List[str]] = None
-):
-    """
-    Inserta filas nuevas en una posición específica EN VIVO.
-    
-    Esta función inserta filas completas moviendo las existentes hacia abajo,
-    llena las nuevas filas con los datos proporcionados, y opcionalmente
-    aplica merges de celdas para mantener el formato de la tabla.
-    
-    Args:
-        client: Cliente de GraphServices
-        file_path: Ruta del archivo en OneDrive
-        fila_inicio: Número de fila donde insertar (1-indexed)
-        datos: Lista de diccionarios con los datos
-        columnas: Mapeo de campo -> offset de columna
-        target_user_id: Email del usuario
-        drive_id: ID del drive
-        sheet_name: Nombre de la hoja
-        columna_inicio: Columna inicial (default=1 para A)
-        merges_a_aplicar: Lista de rangos a mergear en cada fila nueva
-                         Ejemplo: ["A:C", "D:F"] mergeará A-C y D-F en cada fila
-    
-    Ejemplo:
-        insertar_filas_live(
-            client, "ruta/archivo.xlsx",
-            fila_inicio=25,
-            datos=[
-                {"fecha": "2025-01", "medio": "Email", "comentarios": "Nuevo"},
-                {"fecha": "2025-02", "medio": "Tel", "comentarios": "Otro"}
-            ],
-            columnas={"fecha": 0, "medio": 1, "comentarios": 2},
-            target_user_id="user@domain.com"
+    def _get_template(self, template_key: str = None):
+        """Obtiene un template. Si no se especifica template_key, usa el único activo."""
+        query = self.db.query(Templates).filter_by(
+            client_key=self.client_key,
+            is_active=True
         )
-    """
-    # Resolver item_id y worksheet
-    item_id, _ = client._resolve_item_id(file_path, target_user_id=target_user_id, drive_id=drive_id)
-    sheets, _ = client._resolve_worksheets(item_id=item_id, target_user_id=target_user_id, drive_id=drive_id)
+        
+        if template_key:
+            template = query.filter_by(template_key=template_key).first()
+            if not template:
+                raise ValueError(f"Template '{template_key}' no encontrado")
+        else:
+            templates = query.all()
+            if len(templates) == 0:
+                raise ValueError(f"No hay templates activos para '{self.client_key}'")
+            elif len(templates) > 1:
+                keys = [t.template_key for t in templates]
+                raise ValueError(f"Hay {len(templates)} templates activos. Especifica template_key: {keys}")
+            template = templates[0]
+        
+        return template
     
-    if sheet_name:
-        sheet = next((s for s in sheets if s.get("name") == sheet_name), None)
-        if not sheet:
-            raise ValueError(f"Hoja '{sheet_name}' no encontrada")
-    else:
-        sheet = sheets[0]
+    def _get_file(self, file_key: str = None):
+        """Obtiene un archivo. Si no se especifica file_key, usa el más reciente activo."""
+        query = self.db.query(ExcelFiles).filter_by(
+            client_key=self.client_key,
+            is_active=True
+        )
+        
+        if file_key:
+            excel_file = query.filter_by(file_key=file_key).first()
+            if not excel_file:
+                raise ValueError(f"Archivo '{file_key}' no encontrado")
+        else:
+            excel_file = query.order_by(ExcelFiles.created_at.desc()).first()
+            if not excel_file:
+                raise ValueError(f"No hay archivos activos para '{self.client_key}'")
+        
+        return excel_file
     
-    ws_id = sheet["id"]
-    ws_name = sheet["name"]
-    
-    # Construir URL base
-    if drive_id:
-        base = f"{client.graph_url}/drives/{drive_id}/items/{item_id}"
-    else:
-        base = f"{client.graph_url}/users/{target_user_id}/drive/items/{item_id}"
-    
-    num_filas = len(datos)
-    num_columnas = len(columnas)
-    
-    # Preparar matriz de datos
-    matriz = [[None] * num_columnas for _ in range(num_filas)]
-    
-    for row_idx, fila_datos in enumerate(datos):
-        for campo, valor in fila_datos.items():
-            if campo in columnas:
-                col_offset = columnas[campo]
-                matriz[row_idx][col_offset] = valor
-    
-    # Calcular rango
-    col_inicio_letter = _col_index_to_letters(columna_inicio)
-    col_fin_letter = _col_index_to_letters(columna_inicio + num_columnas - 1)
-    fila_fin = fila_inicio + num_filas - 1
-    
-    # Usar dirección simple sin nombre de hoja para el insert
-    range_simple = f"{col_inicio_letter}{fila_inicio}:{col_fin_letter}{fila_fin}"
-    range_con_hoja = f"{ws_name}!{range_simple}"
-    
-    print(f"   📍 Insertando {num_filas} filas en {range_con_hoja}...")
-    
-    # PASO 1: Insertar filas usando el endpoint de filas completas
-    inserted = False
-    
-    try:
-        # Insertar filas completas una por una desde la posición especificada
-        print(f"      💡 Insertando {num_filas} filas completas...")
-        for i in range(num_filas):
-            # La fila actual donde insertar (siempre es fila_inicio porque cada insert mueve las siguientes)
-            row_range = f"{fila_inicio}:{fila_inicio}"
-            insert_url = f"{base}/workbook/worksheets/{ws_id}/range(address='{row_range}')/insert"
-            
-            client._request_with_retry(
-                "POST",
-                insert_url,
-                expected=(200, 201),
-                headers=client._headers(),
-                json={"shift": "Down"}
-            )
-        print(f"      ✓ {num_filas} filas insertadas correctamente")
-        inserted = True
-    except Exception as e1:
-        print(f"      ✗ Error insertando filas completas: {e1}")
-    
-    # Si la inserción falló, usar escritura directa
-    if not inserted:
-        print(f"      💡 Usando escritura directa (sobrescribe celdas existentes)...")
+    def _log_operation(self, op_type: OperationType, excel_file_id: int = None,
+                      template_id: int = None, section_id: int = None,
+                      sheet_name: str = None, marker_text: str = None,
+                      marker_found: bool = None, marker_position: str = None,
+                      rows_affected: int = None, cells_affected: int = None,
+                      input_data: dict = None, output_data: dict = None,
+                      status: RenderStatus = RenderStatus.success,
+                      error_message: str = None, error_code: str = None,
+                      duration_ms: int = None):
+        """Registra una operación en la base de datos."""
         try:
-            url = f"{base}/workbook/worksheets/{ws_id}/range(address='{range_simple}')"
-            client._request_with_retry(
-                "PATCH",
-                url,
-                expected=(200,),
-                headers=client._headers(),
+            log = OperationLogs(
+                operation_id=str(uuid.uuid4()),
+                correlation_id=self.correlation_id,
+                client_key=self.client_key,
+                template_id=template_id,
+                excel_file_id=excel_file_id,
+                operation_type=op_type,
+                section_id=section_id,
+                sheet_name=sheet_name,
+                marker_text=marker_text,
+                marker_found=marker_found,
+                marker_position=marker_position,
+                rows_affected=rows_affected,
+                cells_affected=cells_affected,
+                input_data=input_data,
+                output_data=output_data,
+                status=status,
+                error_message=error_message,
+                error_code=error_code,
+                duration_ms=duration_ms,
+                executed_at=datetime.utcnow()
+            )
+            self.db.add(log)
+            self.db.commit()
+        except Exception as e:
+            print(f"⚠ Error logging operation: {e}")
+            self.db.rollback()
+    
+    def buscar_marcador(self, file_key: str = None, section_key: str = None) -> Tuple[Optional[int], Optional[int]]:
+        """
+        Busca un marcador en el Excel.
+        
+        Args:
+            file_key: Clave del archivo (opcional, usa el más reciente si no se especifica)
+            section_key: Clave de la sección (opcional, usa la única si solo hay una)
+        
+        Returns:
+            (fila, columna) donde se encontró el marcador, o (None, None)
+        """
+        start_time = datetime.now()
+        excel_file, section, _, _, file_path, drive_id, target_user_id = self._get_file_context(file_key, section_key)
+        
+        marker = section.marker_text
+        sheet_name = section.sheet_name
+        
+        print(f"🔍 Buscando '{marker}'...")
+        
+        item_id, _ = self.client._resolve_item_id(file_path, target_user_id=target_user_id, drive_id=drive_id)
+        sheets, _ = self.client._resolve_worksheets(item_id=item_id, target_user_id=target_user_id, drive_id=drive_id)
+        
+        if not sheets:
+            raise ValueError("No se encontraron hojas")
+        
+        if sheet_name:
+            sheet = next((s for s in sheets if s.get("name") == sheet_name), None)
+            if not sheet:
+                raise ValueError(f"Hoja '{sheet_name}' no encontrada")
+        else:
+            sheet = sheets[0]
+        
+        ws_id = sheet["id"]
+        
+        if drive_id:
+            base = f"{self.client.graph_url}/drives/{drive_id}/items/{item_id}"
+        else:
+            base = f"{self.client.graph_url}/users/{target_user_id}/drive/items/{item_id}"
+        
+        url = f"{base}/workbook/worksheets/{ws_id}/usedRange"
+        resp, _ = self.client._request_with_retry("GET", url, expected=(200,), headers=self.client._headers())
+        
+        data = resp.json()
+        values = data.get("values", [])
+        row_offset = data.get("rowIndex", 0)
+        col_offset = data.get("columnIndex", 0)
+        
+        for row_idx, row in enumerate(values):
+            for col_idx, cell_value in enumerate(row):
+                if cell_value and marker in str(cell_value):
+                    fila = row_offset + row_idx + 1
+                    columna = col_offset + col_idx + 1
+                    print(f"   ✓ Encontrado en fila {fila}, columna {columna}")
+                    
+                    duration = int((datetime.now() - start_time).total_seconds() * 1000)
+                    self._log_operation(
+                        op_type=OperationType.search_marker,
+                        excel_file_id=excel_file.id,
+                        section_id=section.id,
+                        sheet_name=sheet_name,
+                        marker_text=marker,
+                        marker_found=True,
+                        marker_position=f"{fila},{columna}",
+                        status=RenderStatus.success,
+                        duration_ms=duration
+                    )
+                    
+                    return (fila, columna)
+        
+        duration = int((datetime.now() - start_time).total_seconds() * 1000)
+        self._log_operation(
+            op_type=OperationType.search_marker,
+            excel_file_id=excel_file.id,
+            section_id=section.id,
+            sheet_name=sheet_name,
+            marker_text=marker,
+            marker_found=False,
+            status=RenderStatus.error,
+            error_message=f"Marcador '{marker}' no encontrado",
+            duration_ms=duration
+        )
+        
+        return (None, None)
+    
+    def llenar_seccion(self, file_key: str, datos: Dict[str, Any], section_key: str = None):
+        """
+        Llena una sección simple (key-value).
+        
+        Args:
+            file_key: Clave del archivo a editar
+            datos: Diccionario {campo: valor}
+            section_key: Clave de la sección (opcional)
+        """
+        start_time = datetime.now()
+        print(f"📝 Llenando sección '{section_key}'...")
+        
+        excel_file, section, fields, _, file_path, drive_id, target_user_id = self._get_file_context(file_key, section_key)
+        
+        if not fields:
+            raise ValueError(f"No hay campos definidos")
+        
+        columnas = {field.field_key: field.column_offset for field in fields}
+        
+        marker_row, marker_col = self.buscar_marcador(file_key, section_key)
+        if not marker_row:
+            raise ValueError(f"No se encontró '{section.marker_text}'")
+        
+        item_id, _ = self.client._resolve_item_id(file_path, target_user_id=target_user_id, drive_id=drive_id)
+        sheets, _ = self.client._resolve_worksheets(item_id=item_id, target_user_id=target_user_id, drive_id=drive_id)
+        
+        if section.sheet_name:
+            sheet = next((s for s in sheets if s.get("name") == section.sheet_name), None)
+        else:
+            sheet = sheets[0]
+        
+        ws_id = sheet["id"]
+        ws_name = sheet["name"]
+        
+        fila_destino = marker_row + section.row_offset
+        
+        if drive_id:
+            base = f"{self.client.graph_url}/drives/{drive_id}/items/{item_id}"
+        else:
+            base = f"{self.client.graph_url}/users/{target_user_id}/drive/items/{item_id}"
+        
+        print(f"   Escribiendo {len(datos)} campos...")
+        cells_written = 0
+        errors = []
+        
+        for campo, valor in datos.items():
+            if campo not in columnas:
+                continue
+            
+            col_offset = columnas[campo]
+            col_destino = marker_col + section.column_offset + col_offset
+            col_letter = _col_index_to_letters(col_destino)
+            
+            cell_address = f"{ws_name}!{col_letter}{fila_destino}"
+            url = f"{base}/workbook/worksheets/{ws_id}/range(address='{cell_address}')"
+            
+            try:
+                self.client._request_with_retry(
+                    "PATCH", url, expected=(200,),
+                    headers=self.client._headers(),
+                    json={"values": [[valor]]}
+                )
+                print(f"      ✓ {campo}")
+                cells_written += 1
+            except Exception as e:
+                print(f"      ✗ {campo}: {e}")
+                errors.append({"field": campo, "error": str(e)})
+        
+        duration = int((datetime.now() - start_time).total_seconds() * 1000)
+        self._log_operation(
+            op_type=OperationType.write_section,
+            excel_file_id=excel_file.id,
+            section_id=section.id,
+            sheet_name=ws_name,
+            cells_affected=cells_written,
+            input_data={"section_key": section_key, "fields": list(datos.keys())},
+            status=RenderStatus.success if not errors else RenderStatus.partial,
+            error_message=str(errors) if errors else None,
+            duration_ms=duration
+        )
+    
+    def llenar_tabla(self, file_key: str, datos: List[Dict[str, Any]], section_key: str = None):
+        """
+        Llena una tabla (múltiples filas).
+        
+        Args:
+            file_key: Clave del archivo a editar
+            datos: Lista de diccionarios con los datos
+            section_key: Clave de la sección (opcional, debe ser is_table=True)
+        """
+        start_time = datetime.now()
+        print(f"📊 Llenando tabla '{section_key}'...")
+        
+        excel_file, section, fields, _, file_path, drive_id, target_user_id = self._get_file_context(file_key, section_key)
+        
+        if not section.is_table:
+            raise ValueError(f"'{section_key}' no es una tabla")
+        
+        if not fields:
+            raise ValueError("No hay campos definidos")
+        
+        columnas = {field.field_key: field.column_offset for field in fields}
+        
+        marker_row, marker_col = self.buscar_marcador(file_key, section_key)
+        if not marker_row:
+            raise ValueError(f"No se encontró '{section.marker_text}'")
+        
+        item_id, _ = self.client._resolve_item_id(file_path, target_user_id=target_user_id, drive_id=drive_id)
+        sheets, _ = self.client._resolve_worksheets(item_id=item_id, target_user_id=target_user_id, drive_id=drive_id)
+        
+        if section.sheet_name:
+            sheet = next((s for s in sheets if s.get("name") == section.sheet_name), None)
+        else:
+            sheet = sheets[0]
+        
+        ws_id = sheet["id"]
+        ws_name = sheet["name"]
+        
+        fila_inicio = marker_row + section.row_offset
+        num_filas = len(datos)
+        num_columnas = len(columnas)
+        
+        matriz = [[None] * num_columnas for _ in range(num_filas)]
+        
+        for row_idx, fila_datos in enumerate(datos):
+            for campo, valor in fila_datos.items():
+                if campo in columnas:
+                    col_offset = columnas[campo]
+                    matriz[row_idx][col_offset] = valor
+        
+        col_inicio_letter = _col_index_to_letters(marker_col + section.column_offset)
+        col_fin_letter = _col_index_to_letters(marker_col + section.column_offset + num_columnas - 1)
+        fila_fin = fila_inicio + num_filas - 1
+        
+        range_address = f"{ws_name}!{col_inicio_letter}{fila_inicio}:{col_fin_letter}{fila_fin}"
+        
+        if drive_id:
+            base = f"{self.client.graph_url}/drives/{drive_id}/items/{item_id}"
+        else:
+            base = f"{self.client.graph_url}/users/{target_user_id}/drive/items/{item_id}"
+        
+        url = f"{base}/workbook/worksheets/{ws_id}/range(address='{range_address}')"
+        
+        print(f"   Escribiendo {num_filas} filas...")
+        
+        try:
+            self.client._request_with_retry(
+                "PATCH", url, expected=(200,),
+                headers=self.client._headers(),
                 json={"values": matriz}
             )
-            print(f"      ✓ Datos escritos directamente (sin insertar)")
-            return  # Salir porque ya terminamos
-        except Exception as e3:
-            print(f"      ✗ Error con escritura directa: {e3}")
-            raise Exception("No se pudo insertar ni escribir las filas")
-    
-    # PASO 2: Llenar las filas insertadas con datos
-    url = f"{base}/workbook/worksheets/{ws_id}/range(address='{range_simple}')"
-    
-    try:
-        client._request_with_retry(
-            "PATCH",
-            url,
-            expected=(200,),
-            headers=client._headers(),
-            json={"values": matriz}
-        )
-        print(f"      ✓ Datos escritos en {num_filas} filas")
-    except Exception as e:
-        print(f"      ✗ Error escribiendo datos: {e}")
-        raise
-    
-    # PASO 3: Aplicar merges si se especificaron
-    if merges_a_aplicar and len(merges_a_aplicar) > 0:
-        try:
-            print(f"      💡 Aplicando merges a {num_filas} filas...")
+            print(f"      ✓ {num_filas} filas escritas")
             
-            for i in range(num_filas):
-                fila_actual = fila_inicio + i
+            duration = int((datetime.now() - start_time).total_seconds() * 1000)
+            self._log_operation(
+                op_type=OperationType.write_table,
+                excel_file_id=excel_file.id,
+                section_id=section.id,
+                sheet_name=ws_name,
+                rows_affected=num_filas,
+                cells_affected=num_filas * num_columnas,
+                input_data={"section_key": section_key, "row_count": num_filas},
+                status=RenderStatus.success,
+                duration_ms=duration
+            )
+        except Exception as e:
+            duration = int((datetime.now() - start_time).total_seconds() * 1000)
+            self._log_operation(
+                op_type=OperationType.write_table,
+                excel_file_id=excel_file.id,
+                section_id=section.id,
+                sheet_name=ws_name,
+                input_data={"section_key": section_key, "row_count": num_filas},
+                status=RenderStatus.error,
+                error_message=str(e),
+                duration_ms=duration
+            )
+            print(f"      ✗ Error: {e}")
+            raise
+        
+        if section.merge_ranges and len(section.merge_ranges) > 0:
+            try:
+                print(f"      Aplicando merges...")
                 
-                for merge_range in merges_a_aplicar:
-                    # El rango puede ser "A:C" o letras de columna
-                    # Lo convertimos a un rango completo con la fila actual
-                    if ":" in merge_range:
-                        col_inicio_merge, col_fin_merge = merge_range.split(":")
-                        rango_merge = f"{col_inicio_merge}{fila_actual}:{col_fin_merge}{fila_actual}"
-                    else:
-                        # Si solo es una columna, no hacer merge
-                        continue
+                for i in range(num_filas):
+                    fila_actual = fila_inicio + i
                     
-                    # Aplicar merge
-                    merge_url = f"{base}/workbook/worksheets/{ws_id}/range(address='{rango_merge}')/merge"
-                    try:
-                        client._request_with_retry(
-                            "POST",
-                            merge_url,
-                            expected=(200, 204),
-                            headers=client._headers(),
-                            json={"across": True}  # Merge horizontal
-                        )
-                    except Exception as e_merge:
-                        print(f"      ⚠️  No se pudo mergear {rango_merge}: {e_merge}")
+                    for merge_range in section.merge_ranges:
+                        if ":" in merge_range:
+                            col_inicio_merge, col_fin_merge = merge_range.split(":")
+                            rango_merge = f"{col_inicio_merge}{fila_actual}:{col_fin_merge}{fila_actual}"
+                        else:
+                            continue
+                        
+                        merge_url = f"{base}/workbook/worksheets/{ws_id}/range(address='{rango_merge}')/merge"
+                        try:
+                            self.client._request_with_retry(
+                                "POST", merge_url, expected=(200, 204),
+                                headers=self.client._headers(),
+                                json={"across": True}
+                            )
+                        except Exception as e_merge:
+                            print(f"      ⚠ No se pudo mergear {rango_merge}")
+                
+                print(f"      ✓ Merges aplicados")
+            except Exception as e_merges:
+                print(f"      ⚠ Error con merges: {e_merges}")
+    
+    def insertar_filas(self, file_key: str, fila_inicio: int, datos: List[Dict[str, Any]], section_key: str = None):
+        """
+        Inserta filas nuevas moviendo las existentes hacia abajo.
+        
+        Args:
+            file_key: Clave del archivo a editar
+            fila_inicio: Número de fila donde insertar (1-indexed)
+            datos: Lista de diccionarios con los datos
+            section_key: Clave de la sección (opcional)
+        """
+        start_time = datetime.now()
+        print(f"➕ Insertando filas en '{section_key}'...")
+        
+        excel_file, section, fields, _, file_path, drive_id, target_user_id = self._get_file_context(file_key, section_key)
+        
+        if not fields:
+            raise ValueError("No hay campos definidos")
+        
+        columnas = {field.field_key: field.column_offset for field in fields}
+        
+        item_id, _ = self.client._resolve_item_id(file_path, target_user_id=target_user_id, drive_id=drive_id)
+        sheets, _ = self.client._resolve_worksheets(item_id=item_id, target_user_id=target_user_id, drive_id=drive_id)
+        
+        if section.sheet_name:
+            sheet = next((s for s in sheets if s.get("name") == section.sheet_name), None)
+            if not sheet:
+                raise ValueError(f"Hoja '{section.sheet_name}' no encontrada")
+        else:
+            sheet = sheets[0]
+        
+        ws_id = sheet["id"]
+        ws_name = sheet["name"]
+        
+        if drive_id:
+            base = f"{self.client.graph_url}/drives/{drive_id}/items/{item_id}"
+        else:
+            base = f"{self.client.graph_url}/users/{target_user_id}/drive/items/{item_id}"
+        
+        num_filas = len(datos)
+        num_columnas = len(columnas)
+        
+        matriz = [[None] * num_columnas for _ in range(num_filas)]
+        
+        for row_idx, fila_datos in enumerate(datos):
+            for campo, valor in fila_datos.items():
+                if campo in columnas:
+                    col_offset = columnas[campo]
+                    matriz[row_idx][col_offset] = valor
+        
+        columna_inicio = section.column_offset + 1
+        col_inicio_letter = _col_index_to_letters(columna_inicio)
+        col_fin_letter = _col_index_to_letters(columna_inicio + num_columnas - 1)
+        fila_fin = fila_inicio + num_filas - 1
+        
+        range_simple = f"{col_inicio_letter}{fila_inicio}:{col_fin_letter}{fila_fin}"
+        
+        print(f"   Insertando {num_filas} filas...")
+        
+        inserted = False
+        try:
+            for i in range(num_filas):
+                row_range = f"{fila_inicio}:{fila_inicio}"
+                insert_url = f"{base}/workbook/worksheets/{ws_id}/range(address='{row_range}')/insert"
+                
+                self.client._request_with_retry(
+                    "POST", insert_url, expected=(200, 201),
+                    headers=self.client._headers(),
+                    json={"shift": "Down"}
+                )
+            print(f"      ✓ Filas insertadas")
+            inserted = True
+        except Exception as e1:
+            print(f"      ⚠ Error insertando: {e1}")
+        
+        if not inserted:
+            print(f"      Usando escritura directa...")
+            try:
+                url = f"{base}/workbook/worksheets/{ws_id}/range(address='{range_simple}')"
+                self.client._request_with_retry(
+                    "PATCH", url, expected=(200,),
+                    headers=self.client._headers(),
+                    json={"values": matriz}
+                )
+                print(f"      ✓ Datos escritos")
+                return
+            except Exception as e3:
+                raise Exception(f"No se pudo insertar: {e3}")
+        
+        url = f"{base}/workbook/worksheets/{ws_id}/range(address='{range_simple}')"
+        
+        try:
+            self.client._request_with_retry(
+                "PATCH", url, expected=(200,),
+                headers=self.client._headers(),
+                json={"values": matriz}
+            )
+            print(f"      ✓ Datos escritos")
             
-            print(f"      ✓ Merges aplicados correctamente")
-        except Exception as e_merges:
-            print(f"      ⚠️  Error aplicando merges: {e_merges}")
+            duration = int((datetime.now() - start_time).total_seconds() * 1000)
+            self._log_operation(
+                op_type=OperationType.insert_rows,
+                excel_file_id=excel_file.id,
+                section_id=section.id,
+                sheet_name=ws_name,
+                rows_affected=num_filas,
+                cells_affected=num_filas * num_columnas,
+                input_data={"section_key": section_key, "fila_inicio": fila_inicio, "row_count": num_filas},
+                status=RenderStatus.success,
+                duration_ms=duration
+            )
+        except Exception as e:
+            duration = int((datetime.now() - start_time).total_seconds() * 1000)
+            self._log_operation(
+                op_type=OperationType.insert_rows,
+                excel_file_id=excel_file.id,
+                section_id=section.id,
+                sheet_name=ws_name,
+                input_data={"section_key": section_key, "fila_inicio": fila_inicio, "row_count": num_filas},
+                status=RenderStatus.error,
+                error_message=str(e),
+                duration_ms=duration
+            )
+            print(f"      ✗ Error: {e}")
+            raise
+        
+        if section.merge_ranges and len(section.merge_ranges) > 0:
+            try:
+                print(f"      Aplicando merges...")
+                
+                for i in range(num_filas):
+                    fila_actual = fila_inicio + i
+                    
+                    for merge_range in section.merge_ranges:
+                        if ":" in merge_range:
+                            col_inicio_merge, col_fin_merge = merge_range.split(":")
+                            rango_merge = f"{col_inicio_merge}{fila_actual}:{col_fin_merge}{fila_actual}"
+                        else:
+                            continue
+                        
+                        merge_url = f"{base}/workbook/worksheets/{ws_id}/range(address='{rango_merge}')/merge"
+                        try:
+                            self.client._request_with_retry(
+                                "POST", merge_url, expected=(200, 204),
+                                headers=self.client._headers(),
+                                json={"across": True}
+                            )
+                        except Exception:
+                            pass
+                
+                print(f"      ✓ Merges aplicados")
+            except Exception as e_merges:
+                print(f"      ⚠ Error con merges: {e_merges}")
+    
+    def procesar_excel(self, file_key: str, secciones: Dict[str, Any]):
+        """
+        Procesa múltiples secciones en un archivo.
+        
+        Args:
+            file_key: Clave del archivo a editar
+            secciones: {"section_key": datos}
+        """
+        print(f"🔥 Procesando Excel '{file_key}'...")
+        
+        excel_file, _, _, _, _, _, _ = self._get_file_context(file_key)
+        
+        for section_key, datos in secciones.items():
+            print(f"\n📝 Sección: {section_key}")
+            
+            section = self.db.query(ExcelSections).filter_by(
+                client_key=self.client_key,
+                template_id=excel_file.template_id,
+                section_key=section_key,
+                is_active=True
+            ).first()
+            
+            if not section:
+                print(f"   ⚠ Sección no encontrada - saltando")
+                continue
+            
+            if section.is_table:
+                self.llenar_tabla(file_key, section_key, datos)
+            else:
+                self.llenar_seccion(file_key, section_key, datos)
+        
+        print("\n✅ Completado")
+    
+    def copy_template(self, dest_file_name: str, template_key: str = None, file_key: str = None, context_data: dict = None) -> Tuple[str, str, int]:
+        """
+        Copia un template sin llenarlo y lo registra en la DB.
+        
+        Args:
+            dest_file_name: Nombre del archivo de destino
+            template_key: Clave del template (opcional, usa el único activo si no se especifica)
+            file_key: Clave única para el archivo (auto-generada si no se provee)
+            context_data: Datos de contexto adicionales (dict)
+        
+        Returns:
+            (item_id, web_url, excel_file_id) del archivo copiado
+        """
+        start_time = datetime.now()
+        
+        template = self._get_template(template_key)
+        print(f"📋 Copiando template '{template.template_key}'...")
+        
+        creds = self.db.query(TenantCredentials).filter_by(
+            client_key=self.client_key,
+            enabled=True
+        ).first()
+        
+        if not creds:
+            raise ValueError("Credenciales no encontradas")
+        
+        storage = self.db.query(StorageTargets).filter_by(
+            client_key=self.client_key,
+            tenant_id=creds.id
+        ).first()
+        
+        if not storage:
+            raise ValueError("Storage no encontrado")
+        
+        def _join_path(*parts):
+            return "/".join(p.strip("/") for p in parts if p)
+        
+        template_path = _join_path(template.template_folder_path, template.template_file_name)
+        dest_path = _join_path(storage.default_dest_folder_path, dest_file_name)
+        
+        drive_id = None
+        target_user_id = None
+        
+        if storage.location_type.value.upper() == "DRIVE":
+            drive_id = storage.location_identifier
+        else:
+            target_user_id = storage.location_identifier
+        
+        print(f"   📂 De: {template_path}")
+        print(f"   📁 A: {dest_path}")
+        
+        print(f"   ⬇ Descargando template...")
+        template_bytes, _ = self.client.download_file_bytes(
+            template_path,
+            target_user_id=target_user_id,
+            drive_id=drive_id
+        )
+        
+        conflict_behavior = getattr(template, 'default_conflict_behavior', 'rename') or 'rename'
+        
+        print(f"   ⬆ Copiando...")
+        result, _ = self.client.upload_file_bytes(
+            template_bytes,
+            dest_path,
+            conflict_behavior=conflict_behavior,
+            target_user_id=target_user_id,
+            drive_id=drive_id
+        )
+        
+        item_id = result.get("id")
+        web_url = result.get("webUrl")
+        
+        print(f"   ✅ Copiado")
+        print(f"      ID: {item_id}")
+        print(f"      URL: {web_url}")
+        
+        # Registrar archivo en la base de datos
+        generated_file_key = file_key or f"{template.template_key}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        new_file = ExcelFiles(
+            client_key=self.client_key,
+            template_id=template.id,
+            storage_target_id=storage.id,
+            file_key=generated_file_key,
+            file_folder_path=storage.default_dest_folder_path,
+            file_name=dest_file_name,
+            item_id=item_id,
+            web_url=web_url,
+            context_data=context_data,
+            is_active=True
+        )
+        
+        try:
+            self.db.add(new_file)
+            self.db.commit()
+            self.db.refresh(new_file)
+            
+            print(f"      📝 Registrado como: {generated_file_key}")
+            
+            duration = int((datetime.now() - start_time).total_seconds() * 1000)
+            self._log_operation(
+                op_type=OperationType.copy_template,
+                template_id=template.id,
+                excel_file_id=new_file.id,
+                input_data={"template_key": template.template_key, "dest_file_name": dest_file_name},
+                output_data={"item_id": item_id, "web_url": web_url, "file_key": generated_file_key},
+                status=RenderStatus.success,
+                duration_ms=duration
+            )
+            
+            return item_id, web_url, new_file.id
+        except Exception as e:
+            self.db.rollback()
+            print(f"      ⚠ Error registrando en DB: {e}")
+            
+            duration = int((datetime.now() - start_time).total_seconds() * 1000)
+            self._log_operation(
+                op_type=OperationType.copy_template,
+                template_id=template.id,
+                input_data={"template_key": template.template_key, "dest_file_name": dest_file_name},
+                output_data={"item_id": item_id, "web_url": web_url},
+                status=RenderStatus.partial,
+                error_message=f"Archivo copiado pero no registrado en DB: {e}",
+                duration_ms=duration
+            )
+            
+            return item_id, web_url, None
