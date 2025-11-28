@@ -484,23 +484,34 @@ class ExcelLiveWriter:
             except Exception as e_merges:
                 print(f"      ⚠ Error con merges: {e_merges}")
     
-    def insertar_filas(self, file_key: str, fila_inicio: int, datos: List[Dict[str, Any]], section_key: str = None):
+    def insertar_filas(self, file_key: str, datos: List[Dict[str, Any]], section_key: str = None):
         """
         Inserta filas nuevas moviendo las existentes hacia abajo.
-        
+
+        La posición de inserción se determina a partir del marcador definido en la
+        sección (como hacen `llenar_seccion` y `llenar_tabla`).
+
         Args:
             file_key: Clave del archivo a editar
-            fila_inicio: Número de fila donde insertar (1-indexed)
             datos: Lista de diccionarios con los datos
             section_key: Clave de la sección (opcional)
         """
         start_time = datetime.now()
         print(f"➕ Insertando filas en '{section_key}'...")
-        
+
         excel_file, section, fields, _, file_path, drive_id, target_user_id = self._get_file_context(file_key, section_key)
-        
+
         if not fields:
             raise ValueError("No hay campos definidos")
+
+        # Obtener marcador y calcular fila de inicio según la definición de la sección
+        marker_row, marker_col = self.buscar_marcador(file_key, section_key)
+        if not marker_row:
+            raise ValueError(f"No se encontró '{section.marker_text}'")
+
+        # La posición donde insertar es marker_row + section.row_offset
+        fila_inicio = marker_row + section.row_offset
+        print(f"   Calculada fila_inicio desde marcador: {fila_inicio}")
         
         columnas = {field.field_key: field.column_offset for field in fields}
         
