@@ -8,8 +8,7 @@ from Services.excel_live_writer import ExcelLiveWriter
 CLIENT_KEY = "eunoia"
 
 # Opcionales: solo si tienes múltiples templates/archivos y necesitas especificar
-TEMPLATE_KEY = "waman_prueba"  # Opcional si solo tienes un template activo
-FILE_KEY = "test_file_002"      # Opcional si solo tienes un archivo activo
+FILE_KEY = "test_file_001"      # Opcional si solo tienes un archivo activo
 
 
 def test_1_copy_template():
@@ -22,7 +21,6 @@ def test_1_copy_template():
         # Si solo tienes UN template activo, no necesitas template_key
         item_id, web_url, file_id = writer.copy_template(
             dest_file_name="Test_Simple2.xlsx",
-            # template_key=TEMPLATE_KEY,  # Opcional
             file_key=FILE_KEY,
             context_data={"test": "simple", "fecha": "2025-11-25"}
         )
@@ -108,7 +106,7 @@ def test_4_llenar_tabla():
         writer.llenar_tabla(
             file_key=FILE_KEY,
             datos=datos_tabla,
-            section_key="seguimiento"
+            section_key= "cliente"
         )
         
         print(f"\n✓ Tabla llenada con {len(datos_tabla)} filas")
@@ -136,7 +134,6 @@ def test_5_insertar_filas():
     with ExcelLiveWriter(client_key=CLIENT_KEY) as writer:
         writer.insertar_filas(
             file_key=FILE_KEY,
-            fila_inicio=25,
             datos=nuevas_filas,
             section_key="seguimiento"
         )
@@ -189,13 +186,13 @@ if __name__ == "__main__":
         # Comenta/descomenta los tests que quieras ejecutar
         
         # Test 1: Copiar template y crear archivo en DB
-        #test_1_copy_template()
+        test_1_copy_template()
         
         # Test 2: Buscar un marcador
         # test_2_buscar_marcador()
         
         # Test 3: Llenar una sección simple
-        test_3_llenar_seccion()
+        # test_3_llenar_seccion()
         
         # Test 4: Llenar una tabla con múltiples filas
         # test_4_llenar_tabla()
