@@ -9,12 +9,13 @@ from Postgress.Tables import (
     TenantUsers,
     StorageTargets,
     Templates,
-    RenderLogs,
+    OperationLogs,
+    OperationType,
     RenderStatus,
 )
 from Auth.Microsoft_Graph_Auth import MicrosoftGraphAuthenticator
 from Services.graph_services import GraphServices, GraphAPIError
-from Services.excel_section_writer import fill_sections_in_memory
+from Services.excel_section_writer import procesar_excel_completo
 from validators.payload import (
     ALLOWED_IDENTIFIER_RE,
     CELL_REF_RE,
@@ -271,8 +272,9 @@ def render_upload():
                 }), 400
             
             try:
-                filled_out = fill_sections_in_memory(tpl_bytes, body["sections"], section_configs)
-                filled_bytes = filled_out.getvalue()
+                # procesar_excel_completo returns a BytesIO
+                output_io = procesar_excel_completo(template_bytes=tpl_bytes, secciones=body["sections"], configuracion=section_configs)
+                filled_bytes = output_io.getvalue()
             except ValueError as ve:
                 return jsonify({"error": f"Error al procesar secciones: {str(ve)}"}), 400
         else:
@@ -300,18 +302,21 @@ def render_upload():
         # Guardar data_json según el modo usado
         data_for_log = body.get("sections") if uses_sections else body.get("data")
         
-        log_row = RenderLogs(
+        log_row = OperationLogs(
             client_key=body["client_key"],
             template_id=template.id,
-            template_key=template.template_key,
-            data_json=data_for_log,
-            result_drive_item_id=upload_result.get("id"),
-            result_web_url=upload_result.get("webUrl"),
-            status=RenderStatus.SUCCESS,
+            operation_type=OperationType.copy_template,
+            input_data=data_for_log,
+            output_data={
+                "drive_item_id": upload_result.get("id"),
+                "web_url": upload_result.get("webUrl"),
+                "dest_file_name": dest_file_name,
+            },
+            status=RenderStatus.success,
             requested_by=body.get("requested_by", "eco-agent"),
-            created_at=datetime.utcnow(),
+            executed_at=datetime.utcnow(),
             duration_ms=duration_ms,
-            dest_file_name=dest_file_name,
+            ms_request_ids={"download_template": ms_id_download, "upload_file": ms_id_upload},
         )
 
         db.add(log_row)
@@ -334,17 +339,17 @@ def render_upload():
     except GraphAPIError as ge:
         try:
             duration_ms = int((time.perf_counter() - t0) * 1000)
-            log_row = RenderLogs(
+            log_row = OperationLogs(
                 client_key=body.get("client_key"),
                 template_id=template.id if template else None,
-                template_key=body.get("template_key", "__unknown_template__"),
-                data_json=body.get("data", {}),
-                status=RenderStatus.ERROR,
+                operation_type=OperationType.copy_template,
+                input_data=body.get("data", {}),
+                status=RenderStatus.error,
                 error_message=f"{ge.message} | ms-request-id={ge.ms_request_id}",
                 requested_by=body.get("requested_by", "eco-agent"),
-                created_at=datetime.utcnow(),
+                executed_at=datetime.utcnow(),
                 duration_ms=duration_ms,
-                dest_file_name=dest_file_name,
+                output_data={"dest_file_name": dest_file_name},
             )
             db.add(log_row)
         except Exception:
@@ -362,17 +367,17 @@ def render_upload():
     except Exception as e:
         try:
             duration_ms = int((time.perf_counter() - t0) * 1000)
-            log_row = RenderLogs(
+            log_row = OperationLogs(
                 client_key=body.get("client_key"),
                 template_id=template.id if template else None,
-                template_key=body.get("template_key", "__unknown_template__"),
-                data_json=body.get("data", {}),
-                status=RenderStatus.ERROR,
+                operation_type=OperationType.copy_template,
+                input_data=body.get("data", {}),
+                status=RenderStatus.error,
                 error_message=str(e),
                 requested_by=body.get("requested_by", "eco-agent"),
-                created_at=datetime.utcnow(),
+                executed_at=datetime.utcnow(),
                 duration_ms=duration_ms,
-                dest_file_name=dest_file_name,
+                output_data={"dest_file_name": dest_file_name},
             )
             db.add(log_row)
         except Exception:
@@ -540,16 +545,16 @@ def write_cells():
 
         # Log (sin template_id porque es edición directa)
         duration_ms = int((time.perf_counter() - t0) * 1000)
-        log_row = RenderLogs(
+        log_row = OperationLogs(
             client_key=body["client_key"],
             template_id=None,  # importante: None, no 0
-            template_key="__manual_write__",
-            data_json=body["data"],
-            status=log_status,
+            operation_type=OperationType.update_cell,
+            input_data=body["data"],
+            output_data={"dest_file_name": body["dest_file_name"]},
+            status=RenderStatus.success if log_status == RenderStatus.SUCCESS else RenderStatus.error,
             requested_by=body.get("requested_by", "eco-agent"),
-            created_at=datetime.utcnow(),
+            executed_at=datetime.utcnow(),
             duration_ms=duration_ms,
-            dest_file_name=body["dest_file_name"],
             error_message=error_summary,
         )
         db.add(log_row)
@@ -569,17 +574,17 @@ def write_cells():
     except GraphAPIError as ge:
         try:
             duration_ms = int((time.perf_counter() - t0) * 1000)
-            log_row = RenderLogs(
+            log_row = OperationLogs(
                 client_key=body.get("client_key"),
                 template_id=None,
-                template_key="__manual_write__",
-                data_json=body.get("data", {}),
-                status=RenderStatus.ERROR,
+                operation_type=OperationType.update_cell,
+                input_data=body.get("data", {}),
+                status=RenderStatus.error,
                 error_message=f"{ge.message} | ms-request-id={ge.ms_request_id}",
                 requested_by=body.get("requested_by", "eco-agent"),
-                created_at=datetime.utcnow(),
+                executed_at=datetime.utcnow(),
                 duration_ms=duration_ms,
-                dest_file_name=body.get("dest_file_name"),
+                output_data={"dest_file_name": body.get("dest_file_name")},
             )
             db.add(log_row)
         except Exception:
@@ -598,17 +603,17 @@ def write_cells():
         # Intentar registrar el error también
         try:
             duration_ms = int((time.perf_counter() - t0) * 1000)
-            log_row = RenderLogs(
+            log_row = OperationLogs(
                 client_key=body.get("client_key"),
                 template_id=None,
-                template_key="__manual_write__",
-                data_json=body.get("data", {}),
-                status=RenderStatus.ERROR,
+                operation_type=OperationType.update_cell,
+                input_data=body.get("data", {}),
+                status=RenderStatus.error,
                 error_message=str(e),
                 requested_by=body.get("requested_by", "eco-agent"),
-                created_at=datetime.utcnow(),
+                executed_at=datetime.utcnow(),
                 duration_ms=duration_ms,
-                dest_file_name=body["dest_file_name"]
+                output_data={"dest_file_name": body.get("dest_file_name")},
             )
             db.add(log_row)
             # db.commit()  # opcional, tu teardown gestionará rollback si vuelve a fallar

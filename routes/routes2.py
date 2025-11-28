@@ -84,8 +84,6 @@ def fill_section():
 	- client_key (str): client identifier (required)
 	- file_key (str): the target file identifier (required)
 	- datos (object): dict of field_key -> value to write (required)
-
-	Optional JSON params:
 	- section_key (str): the logical section to fill (optional if file has a single section)
 
 	Example (narrative): after copying the wedding template for `eunoia`, call this
