@@ -7,6 +7,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 from routes.routes import graph_bp
+from routes.routes2 import bp as excel_bp
 from Postgress.connection import init_db, SessionLocal
 
 class GraphAPIApp:
@@ -64,6 +65,8 @@ class GraphAPIApp:
 
         # Rutas
         app.register_blueprint(graph_bp, url_prefix="/graph")
+        # Excel API routes (copy/fill endpoints)
+        app.register_blueprint(excel_bp)
         return app
 
     def run(self):

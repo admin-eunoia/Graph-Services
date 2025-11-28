@@ -31,7 +31,7 @@ def init_db():
         TenantUsers,
         StorageTargets,
         Templates,
-        RenderLogs,
+        OperationLogs,
     )
     Base.metadata.create_all(bind=engine)
 
